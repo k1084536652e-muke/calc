@@ -217,17 +217,20 @@ export async function readRange({
 }
 
 /**
- * Builds a Blob from one decrypted chunk at a time. This is used by preview
- * and export paths; the list never calls it.
+ * Decrypts one chunk at a time into independent Blob snapshots. The plaintext
+ * and ciphertext buffers can be released immediately after each Blob is
+ * created, so large exports never allocate one monolithic ArrayBuffer.
  */
-export async function readOriginalBlob({
+export async function readOriginalBlobParts({
   db,
   crypto,
   key,
   metadata,
   shouldAbort = () => false,
+  onProgress = () => {},
 }) {
   const parts = [];
+  let written = 0;
   for (let index = 0; index < metadata.chunkCount; index += 1) {
     assertActive(shouldAbort);
     const [encrypted] = await db.getChunks(metadata.id, [index]);
@@ -240,10 +243,39 @@ export async function readOriginalBlob({
     try {
       // Blob snapshots the bytes, so the decrypted chunk can be released now.
       parts.push(new Blob([plain]));
+      written += plain.length;
+      onProgress({
+        written,
+        total: Number(metadata.size) || written,
+        index,
+        chunkCount: metadata.chunkCount,
+      });
     } finally {
       plain.fill(0);
     }
   }
+  return parts;
+}
+
+/**
+ * Builds a low-peak-memory Blob without ever joining all chunks first.
+ */
+export async function readOriginalBlob({
+  db,
+  crypto,
+  key,
+  metadata,
+  shouldAbort = () => false,
+  onProgress = () => {},
+}) {
+  const parts = await readOriginalBlobParts({
+    db,
+    crypto,
+    key,
+    metadata,
+    shouldAbort,
+    onProgress,
+  });
   return new Blob(parts, { type: metadata.mimeType || "application/octet-stream" });
 }
 

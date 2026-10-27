@@ -13,28 +13,77 @@ import {
 import {
   decryptMetadata,
   decryptThumbnail,
+  encryptMetadata,
+  encryptThumbnail,
   importFileInChunks,
   migrateLegacyRecord,
   readOriginalBlob,
+  readOriginalBlobParts,
 } from "./archive.js";
 import {
   contentId,
   decryptFolder,
   decryptText,
-  deleteContentRecords,
   moveContentRecords,
   removeFolder,
   saveFolder,
   saveText,
 } from "./content.js";
+import {
+  LARGE_EXPORT_CONFIRM_MESSAGE,
+  SHARE_FAILURE_MESSAGE,
+  chooseExportStrategy,
+  exportProgressText,
+  hasLargeExport,
+  isAppleMobile,
+  makeFileFromParts,
+} from "./media-export.js";
+import {
+  loadPreferences,
+  savePreferences,
+} from "./preferences.js";
+import {
+  THUMBNAIL_SIZE,
+  captureVideoThumbnail,
+} from "./thumbnails.js";
+import {
+  getTrashItems,
+  purgeExpiredTrash,
+  purgeTrashItems,
+  restoreTrashItems,
+  trashContentRecords,
+  trashRemainingDays,
+} from "./trash.js";
 
-const THUMBNAIL_SIZE = 480;
 const THUMBNAIL_QUALITY = 0.82;
 const PAGE_SIZE = 48;
 const LARGE_FILE_BYTES = 200 * 1024 * 1024;
-const LARGE_EXPORT_BYTES = 500 * 1024 * 1024;
 const SHARE_MEMORY_LIMIT_BYTES = 64 * 1024 * 1024;
 const THUMBNAIL_CONCURRENCY = 4;
+const SEARCH_DEBOUNCE_MS = 150;
+
+export function needsThumbnailBackfill(record) {
+  return (
+    record.kind === "video" &&
+    !record.legacy &&
+    !(Number(record.thumbnailVersion) >= 2)
+  );
+}
+
+export function mergeThumbnailBackfillMetadata(current, result) {
+  return {
+    ...current,
+    duration: result.duration || current.duration || null,
+    thumbnailVersion: 2,
+  };
+}
+
+export function recordSearchText(record) {
+  return [record.name, record.title, record.body]
+    .filter(Boolean)
+    .join("\n")
+    .toLocaleLowerCase("zh-CN");
+}
 
 function uid() {
   if (typeof globalThis.crypto.randomUUID === "function") {
@@ -175,45 +224,34 @@ async function imageThumbnail(file) {
 }
 
 async function videoThumbnail(file) {
-  const canvas = document.createElement("canvas");
-  canvas.width = THUMBNAIL_SIZE;
-  canvas.height = THUMBNAIL_SIZE;
-  const context = canvas.getContext("2d");
   const objectUrl = URL.createObjectURL(file);
-  const video = document.createElement("video");
-  video.muted = true;
-  video.playsInline = true;
-  video.preload = "metadata";
-  video.src = objectUrl;
+  return captureVideoThumbnail({
+    source: objectUrl,
+    drawFrame: drawCover,
+    createPlaceholder: placeholderCanvas,
+    cleanupSource: () => {
+      URL.revokeObjectURL(objectUrl);
+    },
+  });
+}
 
-  try {
-    await waitForMediaEvent(video, "loadeddata", 8_000);
-    if (Number.isFinite(video.duration) && video.duration > 0.25) {
-      try {
-        video.currentTime = Math.min(0.15, video.duration / 10);
-        await waitForMediaEvent(video, "seeked", 3_000);
-      } catch {
-        // The decoded first frame is still usable.
-      }
-    }
-    if (video.videoWidth <= 0 || video.videoHeight <= 0) {
-      throw new Error("视频没有可用画面");
-    }
-    drawCover(context, video, video.videoWidth, video.videoHeight);
-    return await canvasToBlob(canvas);
-  } catch {
-    return canvasToBlob(placeholderCanvas("视频"));
-  } finally {
-    URL.revokeObjectURL(objectUrl);
-    video.removeAttribute("src");
-    video.load();
-  }
+async function videoThumbnailFromUrl(source) {
+  return captureVideoThumbnail({
+    source,
+    drawFrame: drawCover,
+    createPlaceholder: placeholderCanvas,
+  });
 }
 
 async function createThumbnail(file, kind) {
-  return kind === "video"
-    ? videoThumbnail(file)
-    : imageThumbnail(file);
+  if (kind === "video") {
+    return videoThumbnail(file);
+  }
+  return {
+    blob: await imageThumbnail(file),
+    duration: null,
+    frameCaptured: true,
+  };
 }
 
 function inferKind(file) {
@@ -287,6 +325,21 @@ function formatDate(timestamp) {
   }).format(new Date(timestamp));
 }
 
+function formatDuration(seconds) {
+  const value = Math.max(0, Math.floor(Number(seconds) || 0));
+  const hours = Math.floor(value / 3_600);
+  const minutes = Math.floor((value % 3_600) / 60);
+  const remainder = value % 60;
+  return hours > 0
+    ? `${hours}:${String(minutes).padStart(2, "0")}:${String(
+        remainder
+      ).padStart(2, "0")}`
+    : `${String(minutes).padStart(2, "0")}:${String(remainder).padStart(
+        2,
+        "0"
+      )}`;
+}
+
 async function mapWithConcurrency(items, limit, mapper) {
   const output = new Array(items.length);
   let next = 0;
@@ -325,7 +378,7 @@ function waitForController(timeoutMs = 2_000) {
   });
 }
 
-const PANEL_MARKUP = `
+export const PANEL_MARKUP = `
   <section class="panel" aria-label="本地内容">
     <header class="panel-header">
       <div>
@@ -348,6 +401,12 @@ const PANEL_MARKUP = `
         </label>
         <button id="new-text-button" class="toolbar-action" type="button">新建文本</button>
         <button id="new-folder-button" class="toolbar-action" type="button">新建文件夹</button>
+        <button id="trash-button" class="toolbar-action" type="button" data-panel-action="trash">回收站 <span id="trash-count">0</span></button>
+        <label class="name-toggle">
+          <span>显示名称</span>
+          <input id="show-names-toggle" type="checkbox" checked>
+          <i aria-hidden="true"></i>
+        </label>
         <span id="media-count" class="media-count">0 项</span>
       </div>
 
@@ -355,6 +414,19 @@ const PANEL_MARKUP = `
         <button id="folder-back" type="button">返回</button>
         <strong id="folder-title"></strong>
       </nav>
+
+      <section class="library-search" aria-label="搜索和筛选">
+        <label class="search-field" for="content-search">
+          <span aria-hidden="true">⌕</span>
+          <input id="content-search" type="search" placeholder="搜索名称、标题或正文" autocomplete="off" spellcheck="false">
+        </label>
+        <nav id="content-filters" class="content-filters" aria-label="内容类型">
+          <button class="is-active" type="button" data-content-filter="all" aria-pressed="true">全部</button>
+          <button type="button" data-content-filter="image" aria-pressed="false">图片</button>
+          <button type="button" data-content-filter="video" aria-pressed="false">视频</button>
+          <button type="button" data-content-filter="document" aria-pressed="false">文档</button>
+        </nav>
+      </section>
 
       <section id="folder-section" class="folder-section" aria-label="文件夹">
         <div class="section-heading">
@@ -380,6 +452,17 @@ const PANEL_MARKUP = `
         </div>
         <progress id="import-bar" max="100" value="0">0%</progress>
         <p class="progress-note">请勿离开此页面。写入中的分块会在中断时清理。</p>
+      </div>
+
+      <div id="export-progress" class="import-progress export-progress" hidden>
+        <div>
+          <span id="export-label">正在准备导出…</span>
+          <span id="export-percent">0%</span>
+          <button id="export-cancel" class="inline-cancel" type="button">取消</button>
+          <button id="export-share-button" class="inline-cancel inline-share" type="button" hidden>打开分享面板</button>
+        </div>
+        <progress id="export-bar" max="100" value="0">0%</progress>
+        <p class="progress-note">正在逐块解密并准备文件，可随时取消。</p>
       </div>
 
       <div id="media-grid" class="media-grid"></div>
@@ -431,6 +514,20 @@ const PANEL_MARKUP = `
       </fieldset>
 
       <fieldset class="settings-block">
+        <legend>列表与回收站</legend>
+        <label for="trash-retention">回收站保留时间</label>
+        <select id="trash-retention" name="trashRetention">
+          <option value="7">7 天</option>
+          <option value="15">15 天</option>
+          <option value="30">30 天（默认）</option>
+          <option value="60">60 天</option>
+          <option value="90">90 天</option>
+          <option value="never">从不自动清理</option>
+        </select>
+        <p class="field-help">过期内容会在下次解锁时自动彻底删除。</p>
+      </fieldset>
+
+      <fieldset class="settings-block">
         <legend>应急清除码</legend>
         <p class="field-help">设置后，在首页输入该数字并计算会清除本机内容。此操作无法恢复。</p>
         <label for="destruct-current-pin">当前解锁码</label>
@@ -451,6 +548,26 @@ const PANEL_MARKUP = `
         <button id="wipe-button" class="danger-button" type="button">清除全部本地数据</button>
       </div>
     </form>
+  </section>
+
+  <section id="trash-panel" class="panel-modal" role="dialog" aria-modal="true" aria-labelledby="trash-title" hidden>
+    <div class="panel-sheet trash-sheet">
+      <div class="sheet-header">
+        <div>
+          <p class="eyebrow">可恢复内容</p>
+          <h2 id="trash-title">回收站</h2>
+        </div>
+        <button class="icon-button" type="button" data-trash-action="close" aria-label="关闭回收站">关闭</button>
+      </div>
+      <p id="trash-summary" class="field-help">0 项</p>
+      <div id="trash-list" class="trash-list"></div>
+      <div id="trash-empty" class="trash-empty">回收站是空的</div>
+      <div class="trash-actions">
+        <button type="button" data-trash-action="restore" disabled>恢复</button>
+        <button type="button" data-trash-action="purge" class="is-danger" disabled>彻底删除</button>
+        <button type="button" data-trash-action="empty" class="is-danger" hidden>清空回收站</button>
+      </div>
+    </div>
   </section>
 
   <section id="media-viewer" class="media-viewer" role="dialog" aria-modal="true" aria-labelledby="viewer-title" hidden>
@@ -498,7 +615,14 @@ export class Panel {
 
     this.root = null;
     this.records = [];
+    this.searchIndex = new Map();
     this.folders = [];
+    this.trashItems = [];
+    this.selectedTrashIds = new Set();
+    this.preferences = { showNames: true, trashRetentionDays: 30 };
+    this.searchQuery = "";
+    this.contentFilter = "all";
+    this.searchTimer = 0;
     this.currentFolderId = null;
     this.selectionMode = false;
     this.selectedIds = new Set();
@@ -530,6 +654,11 @@ export class Panel {
     this.streamGeneration = 0;
     this.exportUrls = new Set();
     this.downloadFrames = new Set();
+    this.exportJob = null;
+    this.exportBusy = false;
+    this.pendingShare = null;
+    this.thumbnailBackfillRunning = false;
+    this.thumbnailBackfillAttempted = new Set();
     this.currentImportId = null;
     this.migrationStarted = false;
     this.longPressTimer = 0;
@@ -549,6 +678,8 @@ export class Panel {
         this.closeViewer();
       } else if (!this.elements.textEditor.hidden) {
         void this.closeTextEditor();
+      } else if (!this.elements.trash.hidden) {
+        this.closeTrash();
       } else if (!this.elements.settings.hidden) {
         this.closeSettings();
       }
@@ -582,6 +713,7 @@ export class Panel {
       newPin: byId("new-pin"),
       newPinConfirm: byId("new-pin-confirm"),
       changePinButton: byId("change-pin-button"),
+      trashRetention: byId("trash-retention"),
       destructCurrentPin: byId("destruct-current-pin"),
       destructCode: byId("destruct-code"),
       destructConfirm: byId("destruct-confirm"),
@@ -595,6 +727,11 @@ export class Panel {
       mediaCount: byId("media-count"),
       newTextButton: byId("new-text-button"),
       newFolderButton: byId("new-folder-button"),
+      trashButton: byId("trash-button"),
+      trashCount: byId("trash-count"),
+      showNamesToggle: byId("show-names-toggle"),
+      contentSearch: byId("content-search"),
+      contentFilters: byId("content-filters"),
       folderBreadcrumb: byId("folder-breadcrumb"),
       folderBack: byId("folder-back"),
       folderTitle: byId("folder-title"),
@@ -611,6 +748,12 @@ export class Panel {
       importLabel: byId("import-label"),
       importPercent: byId("import-percent"),
       importBar: byId("import-bar"),
+      exportProgress: byId("export-progress"),
+      exportLabel: byId("export-label"),
+      exportPercent: byId("export-percent"),
+      exportBar: byId("export-bar"),
+      exportCancel: byId("export-cancel"),
+      exportShareButton: byId("export-share-button"),
       migrationProgress: byId("migration-progress"),
       migrationLabel: byId("migration-label"),
       migrationPercent: byId("migration-percent"),
@@ -625,6 +768,10 @@ export class Panel {
       viewerBack: this.root.querySelector('[data-viewer-action="close"]'),
       selectionActions: byId("selection-actions"),
       selectAllButton: byId("select-all-button"),
+      trash: byId("trash-panel"),
+      trashSummary: byId("trash-summary"),
+      trashList: byId("trash-list"),
+      trashEmpty: byId("trash-empty"),
       textEditor: byId("text-editor-panel"),
       textTitleInput: byId("text-title-input"),
       textBodyInput: byId("text-body-input"),
@@ -641,6 +788,8 @@ export class Panel {
           this.onLock();
         } else if (action === "settings") {
           this.openSettings();
+        } else if (action === "trash") {
+          this.openTrash();
         } else if (action === "select") {
           this.toggleSelectionMode();
         }
@@ -650,6 +799,33 @@ export class Panel {
       const settingsButton = event.target.closest("[data-settings-action]");
       if (settingsButton?.dataset.settingsAction === "close") {
         this.closeSettings();
+        return;
+      }
+
+      const trashButton = event.target.closest("[data-trash-action]");
+      if (trashButton) {
+        const action = trashButton.dataset.trashAction;
+        if (action === "close") {
+          this.closeTrash();
+        } else if (action === "restore") {
+          void this.restoreSelectedTrash();
+        } else if (action === "purge") {
+          void this.purgeSelectedTrash();
+        } else if (action === "empty") {
+          void this.emptyTrash();
+        }
+        return;
+      }
+
+      const trashItem = event.target.closest("[data-trash-id]");
+      if (trashItem) {
+        this.toggleTrashSelection(trashItem.dataset.trashId);
+        return;
+      }
+
+      const filterButton = event.target.closest("[data-content-filter]");
+      if (filterButton) {
+        this.setContentFilter(filterButton.dataset.contentFilter);
         return;
       }
 
@@ -745,6 +921,27 @@ export class Panel {
     this.elements.newFolderButton.addEventListener("click", () => {
       void this.createFolder();
     });
+    this.elements.contentSearch.addEventListener("input", () => {
+      window.clearTimeout(this.searchTimer);
+      this.searchTimer = window.setTimeout(() => {
+        this.searchQuery = this.elements.contentSearch.value
+          .trim()
+          .toLocaleLowerCase("zh-CN");
+        this.page = 0;
+        this.renderGrid();
+      }, SEARCH_DEBOUNCE_MS);
+    });
+    this.elements.showNamesToggle.addEventListener("change", () => {
+      void this.updatePreferences({
+        showNames: this.elements.showNamesToggle.checked,
+      });
+    });
+    this.elements.trashRetention.addEventListener("change", () => {
+      const value = this.elements.trashRetention.value;
+      void this.updatePreferences({
+        trashRetentionDays: value === "never" ? null : Number(value),
+      });
+    });
     this.elements.folderBack.addEventListener("click", () => {
       this.openFolder(null);
     });
@@ -826,9 +1023,20 @@ export class Panel {
     this.elements.wipeButton.addEventListener("click", () => {
       void this.wipeAllData();
     });
+    this.elements.exportCancel.addEventListener("click", () => {
+      this.cancelExport();
+    });
+    this.elements.exportShareButton.addEventListener("click", () => {
+      void this.sharePreparedExport();
+    });
     this.elements.settings.addEventListener("click", (event) => {
       if (event.target === this.elements.settings) {
         this.closeSettings();
+      }
+    });
+    this.elements.trash.addEventListener("click", (event) => {
+      if (event.target === this.elements.trash) {
+        this.closeTrash();
       }
     });
   }
@@ -911,18 +1119,35 @@ export class Panel {
     }
     this.thumbnailFailed.clear();
     try {
+      this.preferences = await loadPreferences({
+        crypto: this.crypto,
+        key: this.crypto.masterKey,
+        db: this.db,
+      });
+      await purgeExpiredTrash({
+        crypto: this.crypto,
+        key: this.crypto.masterKey,
+        db: this.db,
+        retentionDays: this.preferences.trashRetentionDays,
+      });
       const [
         envelopes,
         legacySummaries,
         textEnvelopes,
         folderEnvelopes,
         destructRecord,
+        trashItems,
       ] = await Promise.all([
         this.db.getMetaEnvelopes(),
         this.db.getLegacySummaries(),
         this.db.getTextEnvelopes(),
         this.db.getFolderEnvelopes(),
         this.db.getSetting("destruct"),
+        getTrashItems({
+          crypto: this.crypto,
+          key: this.crypto.masterKey,
+          db: this.db,
+        }),
       ]);
       const decrypted = (
         await mapWithConcurrency(envelopes, 4, async (envelope) => {
@@ -984,7 +1209,9 @@ export class Panel {
       this.records = [...decrypted, ...texts, ...legacyRecords].sort(
         (left, right) => right.createdAt - left.createdAt
       );
+      this.rebuildSearchIndex();
       this.destructRecord = destructRecord;
+      this.trashItems = trashItems;
       if (
         this.currentFolderId &&
         !this.folders.some((folder) => folder.id === this.currentFolderId)
@@ -1000,7 +1227,11 @@ export class Panel {
       );
       this.renderGrid();
       this.renderFolders();
+      this.updatePreferenceControls();
       this.updateDestructControls();
+      this.renderTrash();
+      this.updateTrashBadge();
+      void this.startThumbnailBackfill();
     } catch (error) {
       console.error("读取本地内容失败", error);
       if (!this.destroyed) {
@@ -1024,16 +1255,29 @@ export class Panel {
 
     const visibleRecords = this.visibleRecords();
     const inFolder = this.currentFolderId !== null;
+    const searchActive =
+      this.searchQuery.length > 0 || this.contentFilter !== "all";
     const currentFolder = this.folders.find(
       (folder) => folder.id === this.currentFolderId
     );
-    this.elements.folderBreadcrumb.hidden = !inFolder;
+    this.elements.folderBreadcrumb.hidden = !inFolder || searchActive;
     this.elements.folderTitle.textContent = currentFolder?.name || "";
-    this.elements.folderSection.hidden = inFolder;
-    this.elements.newFolderButton.hidden = inFolder;
+    this.elements.folderSection.hidden = inFolder || searchActive;
+    this.elements.newFolderButton.hidden = inFolder || searchActive;
     this.elements.mediaCount.textContent = `${visibleRecords.length} 项`;
     this.elements.emptyState.hidden =
-      visibleRecords.length !== 0 || (!inFolder && this.folders.length > 0);
+      visibleRecords.length !== 0 ||
+      (!inFolder && this.folders.length > 0 && !searchActive);
+    const emptyTitle = this.elements.emptyState.querySelector("h2");
+    const emptyCopy = this.elements.emptyState.querySelector("p");
+    if (emptyTitle && emptyCopy) {
+      emptyTitle.textContent = searchActive
+        ? "没有匹配的内容"
+        : "这里还是空的";
+      emptyCopy.textContent = searchActive
+        ? "换个关键词或内容类型试试。"
+        : "新建文本或导入照片、视频后，内容会加密保存在此设备中。";
+    }
     this.elements.mediaGrid.hidden = visibleRecords.length === 0;
     this.elements.mediaPager.hidden = visibleRecords.length <= PAGE_SIZE;
 
@@ -1045,6 +1289,7 @@ export class Panel {
       button.type = "button";
       button.className =
         record.kind === "text" ? "media-card text-card" : "media-card";
+      button.classList.toggle("hide-names", !this.preferences.showNames);
       button.dataset.mediaId = record.id;
       button.classList.toggle("is-selected", this.selectedIds.has(record.id));
       button.setAttribute(
@@ -1074,9 +1319,32 @@ export class Panel {
         if (record.kind === "video") {
           const badge = document.createElement("span");
           badge.className = "video-badge";
-          badge.textContent = "视频";
+          const play = document.createElement("span");
+          play.className = "video-play";
+          play.setAttribute("aria-hidden", "true");
+          const duration = document.createElement("span");
+          duration.textContent = record.duration
+            ? formatDuration(record.duration)
+            : "视频";
+          badge.append(play, duration);
           button.append(badge);
         }
+      }
+
+      if (record.kind !== "text") {
+        const name = document.createElement("span");
+        name.className = "media-name";
+        name.textContent = record.name || "未命名";
+        button.append(name);
+      }
+      if (searchActive) {
+        const folder = document.createElement("span");
+        folder.className = "media-folder";
+        folder.textContent = record.folderId
+          ? this.folders.find((item) => item.id === record.folderId)?.name ||
+            "文件夹"
+          : "未归类";
+        button.append(folder);
       }
 
       const date = document.createElement("span");
@@ -1117,11 +1385,65 @@ export class Panel {
   }
 
   visibleRecords() {
-    return this.records.filter((record) =>
-      this.currentFolderId === null
-        ? (record.folderId ?? null) === null
-        : record.folderId === this.currentFolderId
-    );
+    const searchActive =
+      this.searchQuery.length > 0 || this.contentFilter !== "all";
+    return this.records.filter((record) => {
+      if (!searchActive) {
+        const inCurrentFolder =
+          this.currentFolderId === null
+            ? (record.folderId ?? null) === null
+            : record.folderId === this.currentFolderId;
+        if (!inCurrentFolder) {
+          return false;
+        }
+      }
+      if (
+        this.contentFilter !== "all" &&
+        this.recordCategory(record) !== this.contentFilter
+      ) {
+        return false;
+      }
+      if (!this.searchQuery) {
+        return true;
+      }
+      return (
+        this.searchIndex.get(record.id)?.includes(this.searchQuery) === true
+      );
+    });
+  }
+
+  recordCategory(record) {
+    if (
+      record.kind === "text" ||
+      String(record.mimeType || "").startsWith("text/") ||
+      record.mimeType === "application/pdf"
+    ) {
+      return "document";
+    }
+    return record.kind === "image" ? "image" : "video";
+  }
+
+  rebuildSearchIndex() {
+    this.searchIndex = new Map();
+    for (const record of this.records) {
+      this.searchIndex.set(record.id, recordSearchText(record));
+    }
+  }
+
+  setContentFilter(filter) {
+    if (!["all", "image", "video", "document"].includes(filter)) {
+      return;
+    }
+    this.contentFilter = filter;
+    this.page = 0;
+    for (const button of this.elements.contentFilters.querySelectorAll(
+      "[data-content-filter]"
+    )) {
+      const active = button.dataset.contentFilter === filter;
+      button.classList.toggle("is-active", active);
+      button.setAttribute("aria-pressed", String(active));
+    }
+    this.renderGrid();
   }
 
   renderFolders() {
@@ -1371,7 +1693,7 @@ export class Panel {
 
   async deleteFolder(folder) {
     const choice = await showChoice(
-      `如何处理“${folder.name}”中的内容？连同内容删除将无法恢复。`,
+      `如何处理“${folder.name}”中的内容？连同内容删除会先移到回收站。`,
       {
         title: "删除文件夹",
         theme: "panel",
@@ -1392,14 +1714,25 @@ export class Panel {
       (record) => record.folderId === folder.id
     );
     try {
-      await removeFolder({
-        crypto: this.crypto,
-        key: this.crypto.masterKey,
-        db: this.db,
-        folder,
-        contents,
-        contentsMode: choice,
-      });
+      let trashed = [];
+      if (choice === "delete") {
+        trashed = await trashContentRecords({
+          crypto: this.crypto,
+          key: this.crypto.masterKey,
+          db: this.db,
+          records: contents,
+          folder,
+        });
+      } else {
+        await removeFolder({
+          crypto: this.crypto,
+          key: this.crypto.masterKey,
+          db: this.db,
+          folder,
+          contents,
+          contentsMode: choice,
+        });
+      }
       if (this.destroyed) {
         return;
       }
@@ -1415,9 +1748,24 @@ export class Panel {
           (record) => record.folderId !== folder.id
         );
       }
+      this.rebuildSearchIndex();
       this.renderFolders();
       this.renderGrid();
-      this.showToast(choice === "move" ? "文件夹已删除" : "文件夹和内容已删除");
+      if (choice === "delete") {
+        this.trashItems = await getTrashItems({
+          crypto: this.crypto,
+          key: this.crypto.masterKey,
+          db: this.db,
+        });
+        this.updateTrashBadge();
+        this.showToast("已移到回收站", {
+          actionLabel: "撤销",
+          duration: 8_000,
+          onAction: () => this.restoreTrashWithUndo(trashed),
+        });
+      } else {
+        this.showToast("文件夹已删除");
+      }
     } catch (error) {
       console.error("删除文件夹失败", error);
       if (!this.destroyed) {
@@ -1514,6 +1862,7 @@ export class Panel {
         } else {
           this.records.unshift({ ...saved, legacy: false });
         }
+        this.rebuildSearchIndex();
         this.textDraft = { ...saved, isNew: false };
         this.elements.textSaveStatus.textContent = "已保存";
         this.renderGrid();
@@ -1595,6 +1944,7 @@ export class Panel {
           ? { ...movedMap.get(record.id), legacy: false }
           : record
       );
+      this.rebuildSearchIndex();
       this.exitSelection();
       this.renderFolders();
       this.showToast(`已移动 ${moved.length} 项`);
@@ -1611,21 +1961,13 @@ export class Panel {
     if (records.length === 0 || this.destroyed) {
       return;
     }
-    const confirmed = await showConfirm(
-      `确定永久删除选中的 ${records.length} 项吗？此操作无法撤销。`,
-      {
-        title: "删除所选内容",
-        confirmText: "删除",
-        cancelText: "取消",
-        danger: true,
-        theme: "panel",
-      }
-    );
-    if (!confirmed || this.destroyed) {
-      return;
-    }
     try {
-      await deleteContentRecords({ db: this.db, records });
+      const trashed = await trashContentRecords({
+        crypto: this.crypto,
+        key: this.crypto.masterKey,
+        db: this.db,
+        records,
+      });
       if (this.destroyed) {
         return;
       }
@@ -1633,9 +1975,20 @@ export class Panel {
       this.records = this.records.filter(
         (record) => !deleted.has(record.id)
       );
+      this.rebuildSearchIndex();
       this.exitSelection();
       this.renderFolders();
-      this.showToast(`已删除 ${deleted.size} 项`);
+      this.trashItems = await getTrashItems({
+        crypto: this.crypto,
+        key: this.crypto.masterKey,
+        db: this.db,
+      });
+      this.updateTrashBadge();
+      this.showToast(`已移到回收站（${deleted.size} 项）`, {
+        actionLabel: "撤销",
+        duration: 8_000,
+        onAction: () => this.restoreTrashWithUndo(trashed),
+      });
     } catch (error) {
       console.error("批量删除失败", error);
       if (!this.destroyed) {
@@ -1683,42 +2036,58 @@ export class Panel {
         return;
       }
       if (action === "download") {
-        this.exportRecords(records);
+        await this.exportRecords(records, { forceDownload: true });
         return;
       }
     }
 
-    if (records.some((record) => record.size > LARGE_EXPORT_BYTES)) {
-      const confirmed = await showConfirm(
-        "所选内容较大，生成分享文件可能需要较多内存。是否继续？",
-        {
-          title: "导出较大内容",
-          confirmText: "继续",
-          cancelText: "取消",
-          theme: "panel",
-        }
-      );
-      if (!confirmed) {
-        return;
-      }
-    }
-    this.exportRecords(records);
+    await this.exportRecords(records);
   }
 
-  async exportRecords(records) {
-    let files = [];
+  async exportRecords(records, { forceDownload = false } = {}) {
+    if (this.destroyed || records.length === 0) {
+      return;
+    }
+    if (hasLargeExport(records)) {
+      const confirmed = await showConfirm(LARGE_EXPORT_CONFIRM_MESSAGE, {
+        title: "导出较大文件",
+        confirmText: "继续导出",
+        cancelText: "取消",
+        theme: "panel",
+      });
+      if (!confirmed || this.destroyed) {
+        return;
+      }
+    }
+    if (this.exportBusy) {
+      this.showToast("正在准备上一次导出");
+      return;
+    }
+    this.exportBusy = true;
+    const ios = isAppleMobile();
+    let strategy = ios ? "ios-download" : "stream-download";
     try {
+      if (forceDownload) {
+        if (ios) {
+          await this.downloadIosRecords(records);
+        } else {
+          await this.downloadRecords(records);
+        }
+        this.showToast(`已开始下载 ${records.length} 个文件`);
+        return;
+      }
       const canAttemptShare =
         typeof navigator.share === "function" &&
         typeof navigator.canShare === "function";
-      const preferStreamingDownload = records.some(
+      const shareApiAvailable = typeof navigator.share === "function";
+      const hasLargeStreamingRecord = records.some(
         (record) =>
           record.kind !== "text" &&
           !record.legacy &&
           Number(record.size) > SHARE_MEMORY_LIMIT_BYTES
       );
-      let canPotentiallyShare = false;
-      if (canAttemptShare && !preferStreamingDownload) {
+      let canShareFiles = false;
+      if (canAttemptShare) {
         const probes = records.map(
           (record) =>
             new File([], record.name || "content", {
@@ -1729,44 +2098,33 @@ export class Panel {
             })
         );
         try {
-          canPotentiallyShare = navigator.canShare({ files: probes });
+          canShareFiles = navigator.canShare({ files: probes }) === true;
         } catch {
-          canPotentiallyShare = false;
+          canShareFiles = false;
         }
       }
-      if (!canPotentiallyShare || preferStreamingDownload) {
+      strategy = chooseExportStrategy({
+        ios,
+        canShareFiles: ios ? shareApiAvailable : canShareFiles,
+        hasLargeStreamingRecord,
+      });
+
+      if (strategy === "stream-download") {
         await this.downloadRecords(records);
         this.showToast(`已开始下载 ${records.length} 个文件`);
         return;
       }
 
-      files = [];
-      for (const record of records) {
-        if (record.kind === "text") {
-          const content = record.title
-            ? `${record.title}\n\n${record.body}`
-            : record.body;
-          const filename = `${
-            this.safeFilename(record.title) || "文本"
-          }.txt`;
-          files.push(
-            new File([content], filename, {
-              type: "text/plain;charset=utf-8",
-            })
-          );
-        } else {
-          const blob = await this.readRecordBlob(record);
-          files.push(
-            new File([blob], record.name, {
-              type: record.mimeType || "application/octet-stream",
-            })
-          );
-        }
-      }
-      if (this.destroyed) {
+      if (strategy === "ios-download") {
+        await this.downloadIosRecords(records);
+        this.showToast("已打开文件下载");
         return;
       }
 
+      let files = await this.prepareExportFiles(records);
+      if (this.destroyed) {
+        return;
+      }
       let canShare = false;
       try {
         canShare =
@@ -1776,31 +2134,293 @@ export class Panel {
         canShare = false;
       }
       if (canShare) {
-        const panelToken = beginSystemPanel();
-        const toast = this.showToast("请在分享面板中选择保存位置");
-        try {
-          await navigator.share({ files });
-          toast?.hide();
-          return;
-        } catch (error) {
-          if (error?.name === "AbortError") {
-            toast?.hide();
-            return;
+        const shareResult =
+          ios && shareApiAvailable
+            ? await this.waitForIosShareGesture(files)
+            : await this.performShare(files);
+        if (shareResult.status === "shared") {
+          if (!this.destroyed) {
+            this.showToast("已完成导出");
           }
-          console.error("批量分享失败，改为下载", error);
-          toast?.hide();
-        } finally {
-          endSystemPanel(panelToken);
+          return;
+        }
+        if (
+          shareResult.status === "aborted" ||
+          shareResult.status === "cancelled"
+        ) {
+          if (!this.destroyed) {
+            this.showToast("已取消分享");
+          }
+          return;
+        }
+        if (shareResult.error) {
+          console.error("批量分享失败", shareResult.error);
+          this.finishExportProgress();
+          await showAlert(SHARE_FAILURE_MESSAGE, {
+            title: "分享未完成",
+            theme: "panel",
+          });
+          return;
         }
       }
 
-      await this.downloadRecords(records);
-      this.showToast(`已开始下载 ${records.length} 个文件`);
+      if (ios) {
+        files = [];
+        await this.downloadIosRecords(records);
+        this.showToast("已打开文件下载");
+      } else {
+        await this.downloadRecords(records);
+        this.showToast(`已开始下载 ${records.length} 个文件`);
+      }
     } catch (error) {
+      if (error?.name === "AbortError") {
+        if (!this.destroyed) {
+          this.showToast("已取消导出");
+        }
+        return;
+      }
       console.error("批量导出失败", error);
       if (!this.destroyed) {
         this.showToast("导出失败，请重试");
       }
+    } finally {
+      this.finishExportProgress();
+      this.exportJob = null;
+      this.exportBusy = false;
+    }
+  }
+
+  prepareExportFiles(records) {
+    const totalBytes = records.reduce(
+      (sum, record) =>
+        sum + (record.kind === "text" ? 1 : Number(record.size) || 0),
+      0
+    );
+    const job = { cancelled: false, totalBytes, completedBytes: 0 };
+    this.exportJob = job;
+    this.beginExportProgress();
+    return this.buildExportFiles(records, job);
+  }
+
+  async performShare(files) {
+    const panelToken = beginSystemPanel();
+    try {
+      await navigator.share({ files });
+      return { status: "shared" };
+    } catch (error) {
+      return {
+        status: error?.name === "AbortError" ? "aborted" : "failed",
+        error,
+      };
+    } finally {
+      endSystemPanel(panelToken);
+    }
+  }
+
+  waitForIosShareGesture(files) {
+    if (!this.elements?.exportShareButton) {
+      return this.performShare(files);
+    }
+    this.elements.exportLabel.textContent = "文件已准备好";
+    this.elements.exportPercent.textContent = "100%";
+    this.elements.exportBar.value = 100;
+    this.elements.exportShareButton.hidden = false;
+    this.elements.exportShareButton.disabled = false;
+    this.elements.exportCancel.textContent = "取消";
+    return new Promise((resolve) => {
+      this.pendingShare = { files, resolve };
+    });
+  }
+
+  async sharePreparedExport() {
+    if (!this.pendingShare) {
+      return;
+    }
+    const pending = this.pendingShare;
+    this.pendingShare = null;
+    this.elements.exportShareButton.disabled = true;
+    this.elements.exportLabel.textContent = "正在打开系统分享…";
+    const result = await this.performShare(pending.files);
+    pending.resolve(result);
+  }
+
+  async buildExportFiles(records, job) {
+    const files = [];
+    for (const record of records) {
+      this.throwIfExportCancelled(job);
+      if (record.kind === "text") {
+        const content = record.title
+          ? `${record.title}\n\n${record.body}`
+          : record.body;
+        const filename = `${
+          this.safeFilename(record.title) || "文本"
+        }.txt`;
+        files.push(
+          new File([content], filename, {
+            type: "text/plain;charset=utf-8",
+          })
+        );
+        job.completedBytes += 1;
+        this.updateExportProgress(job);
+        continue;
+      }
+
+      const parts = await this.readExportParts(record, job);
+      this.throwIfExportCancelled(job);
+      files.push(
+        makeFileFromParts(
+          parts,
+          this.safeFilename(record.name) || "内容",
+          record.mimeType || "application/octet-stream"
+        )
+      );
+    }
+    return files;
+  }
+
+  async readExportParts(record, job) {
+    const metadata = await this.resolveLegacyReference(record);
+    if (metadata.legacy) {
+      const legacy = await this.db.getLegacyRecord(metadata.id);
+      if (!legacy) {
+        throw new Error("旧记录不存在");
+      }
+      const plain = await this.crypto.decrypt(
+        legacy.ciphertext,
+        legacy.iv,
+        this.legacyKey
+      );
+      try {
+        job.completedBytes += plain.byteLength;
+        this.updateExportProgress(job);
+        return [new Blob([plain], { type: metadata.mimeType })];
+      } finally {
+        plain.fill(0);
+      }
+    }
+
+    const recordStart = job.completedBytes;
+    return readOriginalBlobParts({
+      db: this.db,
+      crypto: this.crypto,
+      key: this.crypto.masterKey,
+      metadata,
+      shouldAbort: () =>
+        job.cancelled || this.destroyed,
+      onProgress: ({ written }) => {
+        job.completedBytes = recordStart + written;
+        this.updateExportProgress(job);
+      },
+    });
+  }
+
+  async downloadIosRecords(records) {
+    const totalBytes = records.reduce(
+      (sum, record) =>
+        sum + (record.kind === "text" ? 1 : Number(record.size) || 0),
+      0
+    );
+    const job = { cancelled: false, totalBytes, completedBytes: 0 };
+    this.exportJob = job;
+    this.beginExportProgress();
+    for (const record of records) {
+      this.throwIfExportCancelled(job);
+      if (record.kind === "text") {
+        const content = record.title
+          ? `${record.title}\n\n${record.body}`
+          : record.body;
+        const filename = `${
+          this.safeFilename(record.title) || "文本"
+        }.txt`;
+        this.downloadBlob(
+          new File([content], filename, {
+            type: "text/plain;charset=utf-8",
+          }),
+          filename,
+          true
+        );
+        job.completedBytes += 1;
+        this.updateExportProgress(job);
+        continue;
+      }
+      const parts = await this.readExportParts(record, job);
+      this.throwIfExportCancelled(job);
+      const blob = new Blob(parts, {
+        type: record.mimeType || "application/octet-stream",
+      });
+      this.downloadBlob(
+        blob,
+        this.safeFilename(record.name) || "内容",
+        true
+      );
+    }
+  }
+
+  beginExportProgress() {
+    if (!this.elements?.exportProgress) {
+      return;
+    }
+    this.elements.exportProgress.hidden = false;
+    this.elements.exportBar.value = 0;
+    this.elements.exportPercent.textContent = "0%";
+    this.elements.exportLabel.textContent = exportProgressText(0, 0);
+    this.elements.exportShareButton.hidden = true;
+    this.elements.exportShareButton.disabled = false;
+    this.elements.exportCancel.textContent = "取消";
+    this.elements.exportCancel.disabled = false;
+  }
+
+  updateExportProgress(job) {
+    if (!this.elements?.exportProgress || this.destroyed) {
+      return;
+    }
+    const percent =
+      job.totalBytes <= 0
+        ? 100
+        : Math.min(
+            100,
+            Math.round((job.completedBytes / job.totalBytes) * 100)
+          );
+    this.elements.exportBar.value = percent;
+    this.elements.exportPercent.textContent = `${percent}%`;
+    this.elements.exportLabel.textContent = exportProgressText(
+      Math.min(job.completedBytes, job.totalBytes),
+      job.totalBytes
+    );
+  }
+
+  finishExportProgress() {
+    if (this.elements?.exportProgress) {
+      this.elements.exportProgress.hidden = true;
+      this.elements.exportCancel.disabled = false;
+      this.elements.exportShareButton.hidden = true;
+      this.elements.exportShareButton.disabled = false;
+    }
+    this.elements?.exportCancel &&
+      (this.elements.exportCancel.textContent = "取消");
+  }
+
+  cancelExport() {
+    if (this.pendingShare) {
+      const pending = this.pendingShare;
+      this.pendingShare = null;
+      pending.resolve({ status: "cancelled" });
+      return;
+    }
+    if (!this.exportJob) {
+      return;
+    }
+    this.exportJob.cancelled = true;
+    this.elements.exportCancel.disabled = true;
+    this.elements.exportCancel.textContent = "正在取消…";
+    this.elements.exportLabel.textContent = "正在取消导出…";
+  }
+
+  throwIfExportCancelled(job) {
+    if (job.cancelled || this.destroyed) {
+      const error = new Error("导出已取消");
+      error.name = "AbortError";
+      throw error;
     }
   }
 
@@ -1820,13 +2440,20 @@ export class Panel {
       } else if (!record.legacy) {
         await this.downloadStreamingRecord(record);
       } else {
-        this.downloadBlob(await this.readRecordBlob(record), record.name);
+        this.downloadBlob(
+          await this.readRecordBlob(record),
+          record.name,
+          isAppleMobile()
+        );
       }
     }
     return records.length;
   }
 
   async downloadStreamingRecord(record) {
+    if (isAppleMobile()) {
+      throw new Error("iOS 不使用隐藏页面下载");
+    }
     await navigator.serviceWorker.ready;
     const controller = await waitForController();
     const registration = this.makeMediaRegistration(record);
@@ -1948,6 +2575,123 @@ export class Panel {
     }
   }
 
+  async startThumbnailBackfill() {
+    if (
+      this.thumbnailBackfillRunning ||
+      this.destroyed ||
+      !("serviceWorker" in navigator)
+    ) {
+      return;
+    }
+    const pending = this.records.filter(
+      (record) =>
+        needsThumbnailBackfill(record) &&
+        !this.thumbnailBackfillAttempted.has(record.id)
+    );
+    if (pending.length === 0) {
+      return;
+    }
+    this.thumbnailBackfillRunning = true;
+    try {
+      await navigator.serviceWorker.ready;
+      const controller = await waitForController();
+      if (!controller) {
+        return;
+      }
+      for (const record of pending) {
+        if (this.destroyed) {
+          return;
+        }
+        this.thumbnailBackfillAttempted.add(record.id);
+        const registration = this.makeMediaRegistration(record);
+        if (!registration) {
+          continue;
+        }
+        try {
+          await this.sendWorkerMessage(controller, registration);
+          const result = await videoThumbnailFromUrl(
+            new URL(
+              `./__media/${encodeURIComponent(
+                record.id
+              )}?thumbnail=${Date.now()}`,
+              window.location.href
+            ).href
+          );
+          if (!result.frameCaptured || this.destroyed) {
+            continue;
+          }
+          const metadata = await this.saveThumbnailBackfillResult(
+            record,
+            result
+          );
+          if (!metadata) {
+            continue;
+          }
+          if (this.destroyed) {
+            return;
+          }
+          this.records = this.records.map((item) =>
+            item.id === record.id ? metadata : item
+          );
+          this.thumbnailFailed.delete(record.id);
+          this.rebuildSearchIndex();
+          this.renderGrid();
+        } catch (error) {
+          if (!this.destroyed) {
+            console.error("视频缩略图补生成失败", error);
+          }
+        } finally {
+          controller.postMessage({
+            type: "unregister-media",
+            mediaId: record.id,
+          });
+        }
+      }
+    } finally {
+      this.thumbnailBackfillRunning = false;
+      if (
+        !this.destroyed &&
+        this.records.some(
+          (record) =>
+            needsThumbnailBackfill(record) &&
+            !this.thumbnailBackfillAttempted.has(record.id)
+        )
+      ) {
+        window.setTimeout(() => {
+          void this.startThumbnailBackfill();
+        }, 0);
+      }
+    }
+  }
+
+  async saveThumbnailBackfillResult(record, result) {
+    const currentEnvelope = await this.db.getMetaEnvelope(record.id);
+    if (!currentEnvelope) {
+      return null;
+    }
+    const trashedEnvelope = await this.db.getTrashMetaEnvelope?.(record.id);
+    if (trashedEnvelope) {
+      return null;
+    }
+    const current = await decryptMetadata(
+      this.crypto,
+      this.crypto.masterKey,
+      currentEnvelope
+    );
+    const metadata = mergeThumbnailBackfillMetadata(current, result);
+    const [thumbnailEnvelope, metadataEnvelope] = await Promise.all([
+      encryptThumbnail(
+        this.crypto,
+        this.crypto.masterKey,
+        record.id,
+        result.blob
+      ),
+      encryptMetadata(this.crypto, this.crypto.masterKey, metadata),
+    ]);
+    await this.db.saveMedia(metadataEnvelope, thumbnailEnvelope);
+    return metadata;
+  }
+
   async importFiles(files) {
     const validFiles = files.filter((file) => inferKind(file));
     if (validFiles.length === 0) {
@@ -1987,7 +2731,7 @@ export class Panel {
         }`;
 
         try {
-          const thumbnail = await createThumbnail(file, kind);
+          const thumbnailResult = await createThumbnail(file, kind);
           const metadata = {
             name:
               file.name ||
@@ -1997,6 +2741,10 @@ export class Panel {
             createdAt: Date.now(),
             type: "media",
             folderId: this.currentFolderId,
+            duration:
+              kind === "video" ? thumbnailResult.duration || null : null,
+            thumbnailVersion:
+              kind === "video" && thumbnailResult.frameCaptured ? 2 : 0,
           };
           const importedMetadata = await importFileInChunks({
             file,
@@ -2005,7 +2753,7 @@ export class Panel {
             crypto: this.crypto,
             db: this.db,
             metadata,
-            thumbnail,
+            thumbnail: thumbnailResult.blob,
             shouldAbort: () => this.destroyed,
             onProgress: ({ written }) => {
               const current = completedBytes + written;
@@ -2025,6 +2773,7 @@ export class Panel {
             break;
           }
           this.records.unshift({ ...importedMetadata, legacy: false });
+          this.rebuildSearchIndex();
           imported += 1;
         } catch (error) {
           await this.db.deleteMedia(mediaId).catch(() => {});
@@ -2055,6 +2804,7 @@ export class Panel {
       this.renderGrid();
       this.renderFolders();
       this.showToast(`已导入 ${imported} 项`);
+      void this.startThumbnailBackfill();
     }
   }
 
@@ -2076,12 +2826,22 @@ export class Panel {
         8 * 1024 * 1024;
       const available = Math.max(0, quota - usage);
       if (required > available) {
+        const trashBytes = this.trashItems.reduce(
+          (sum, item) => sum + (Number(item.storageSize) || 0),
+          0
+        );
         await showAlert(
           `可用空间约 ${formatSize(
             available
           )}，本次内容至少需要 ${formatSize(
             required
-          )}。请先清理空间后再试。`,
+          )}。${
+            trashBytes > 0
+              ? `回收站约占 ${formatSize(
+                  trashBytes
+                )}，可清空回收站释放空间。`
+              : "请先清理空间后再试。"
+          }`,
           {
             title: "存储空间不足",
             theme: "panel",
@@ -2711,6 +3471,7 @@ export class Panel {
       this.records = this.records.map((item) =>
         item.id === resolved.id ? resolved : item
       );
+      this.rebuildSearchIndex();
       if (this.viewerRecord?.id === resolved.id) {
         this.viewerRecord = resolved;
       }
@@ -2720,12 +3481,15 @@ export class Panel {
     }
   }
 
-  downloadBlob(blob, filename) {
+  downloadBlob(blob, filename, newContext = false) {
     const url = URL.createObjectURL(blob);
     const anchor = document.createElement("a");
     anchor.href = url;
     anchor.download = filename || "内容";
     anchor.rel = "noopener";
+    if (newContext) {
+      anchor.target = "_blank";
+    }
     document.body.append(anchor);
     anchor.click();
     anchor.remove();
@@ -2814,6 +3578,7 @@ export class Panel {
               ? { ...migrated, legacy: false }
               : item
           );
+          this.rebuildSearchIndex();
           this.thumbnailFailed.clear();
           this.renderGrid();
           this.renderFolders();
@@ -2869,6 +3634,293 @@ export class Panel {
     }
   }
 
+  updatePreferenceControls() {
+    if (!this.elements) {
+      return;
+    }
+    this.elements.showNamesToggle.checked = this.preferences.showNames;
+    this.elements.trashRetention.value =
+      this.preferences.trashRetentionDays === null
+        ? "never"
+        : String(this.preferences.trashRetentionDays);
+    this.renderGrid();
+  }
+
+  async updatePreferences(changes) {
+    const previous = { ...this.preferences };
+    this.preferences = { ...this.preferences, ...changes };
+    this.renderGrid();
+    try {
+      this.preferences = await savePreferences({
+        crypto: this.crypto,
+        key: this.crypto.masterKey,
+        db: this.db,
+        preferences: this.preferences,
+      });
+      this.updatePreferenceControls();
+    } catch (error) {
+      console.error("保存列表偏好失败", error);
+      this.preferences = previous;
+      this.updatePreferenceControls();
+      if (!this.destroyed) {
+        this.showToast("设置保存失败，请重试");
+      }
+    }
+  }
+
+  updateTrashBadge() {
+    if (!this.elements?.trashCount) {
+      return;
+    }
+    this.elements.trashCount.textContent = String(this.trashItems.length);
+  }
+
+  openTrash() {
+    if (this.destroyed) {
+      return;
+    }
+    this.toastController?.hide();
+    this.toastController = null;
+    this.closeSettings();
+    this.selectedTrashIds.clear();
+    this.renderTrash();
+    this.elements.trash.hidden = false;
+  }
+
+  closeTrash() {
+    if (!this.elements?.trash) {
+      return;
+    }
+    this.elements.trash.hidden = true;
+    this.selectedTrashIds.clear();
+  }
+
+  renderTrash() {
+    if (!this.elements?.trashList) {
+      return;
+    }
+    const fragment = document.createDocumentFragment();
+    for (const item of this.trashItems) {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "trash-item";
+      button.dataset.trashId = item.id;
+      button.classList.toggle(
+        "is-selected",
+        this.selectedTrashIds.has(item.id)
+      );
+
+      const icon = document.createElement("span");
+      icon.className = "trash-item-icon";
+      icon.textContent =
+        item.trashType === "folder"
+          ? "文件夹"
+          : item.kind === "video"
+            ? "视频"
+            : item.kind === "image"
+              ? "图片"
+              : "文档";
+      const copy = document.createElement("span");
+      copy.className = "trash-item-copy";
+      const name = document.createElement("strong");
+      name.textContent = item.displayName || "内容";
+      const detail = document.createElement("small");
+      const remaining = trashRemainingDays(
+        item,
+        this.preferences.trashRetentionDays
+      );
+      detail.textContent = [
+        `删除于 ${formatDate(item.trashedAt)}`,
+        remaining === null ? "不自动清理" : `剩余 ${remaining} 天`,
+        item.storageSize ? formatSize(item.storageSize) : "",
+      ]
+        .filter(Boolean)
+        .join(" · ");
+      copy.append(name, detail);
+      const check = document.createElement("span");
+      check.className = "trash-item-check";
+      check.textContent = this.selectedTrashIds.has(item.id) ? "✓" : "";
+      button.append(icon, copy, check);
+      fragment.append(button);
+    }
+    this.elements.trashList.replaceChildren(fragment);
+    this.elements.trashEmpty.hidden = this.trashItems.length !== 0;
+    const bytes = this.trashItems.reduce(
+      (sum, item) => sum + (Number(item.storageSize) || 0),
+      0
+    );
+    this.elements.trashSummary.textContent =
+      `${this.trashItems.length} 项 · 内容约 ${formatSize(bytes)} · ` +
+      (this.preferences.trashRetentionDays === null
+        ? "不自动清理"
+        : `${this.preferences.trashRetentionDays} 天后自动清理`);
+    this.updateTrashSelectionUi();
+  }
+
+  updateTrashSelectionUi() {
+    if (!this.elements?.trash) {
+      return;
+    }
+    for (const button of this.elements.trashList.querySelectorAll(
+      "[data-trash-id]"
+    )) {
+      const selected = this.selectedTrashIds.has(button.dataset.trashId);
+      button.classList.toggle("is-selected", selected);
+      const check = button.querySelector(".trash-item-check");
+      if (check) {
+        check.textContent = selected ? "✓" : "";
+      }
+    }
+    for (const button of this.elements.trash.querySelectorAll(
+      '[data-trash-action="restore"], [data-trash-action="purge"]'
+    )) {
+      button.disabled = this.selectedTrashIds.size === 0;
+    }
+    const empty = this.elements.trash.querySelector(
+      '[data-trash-action="empty"]'
+    );
+    empty.hidden = this.trashItems.length === 0;
+    empty.disabled = this.trashItems.length === 0;
+  }
+
+  toggleTrashSelection(id) {
+    if (this.selectedTrashIds.has(id)) {
+      this.selectedTrashIds.delete(id);
+    } else {
+      this.selectedTrashIds.add(id);
+    }
+    this.updateTrashSelectionUi();
+  }
+
+  selectedTrashItems() {
+    return this.trashItems.filter((item) =>
+      this.selectedTrashIds.has(item.id)
+    );
+  }
+
+  async restoreTrashWithUndo(items) {
+    if (this.destroyed || items.length === 0) {
+      return;
+    }
+    try {
+      await restoreTrashItems({
+        crypto: this.crypto,
+        key: this.crypto.masterKey,
+        db: this.db,
+        items,
+        existingFolderIds: new Set(
+          this.folders.map((folder) => folder.id)
+        ),
+      });
+      this.selectedTrashIds.clear();
+      await this.refreshRecords();
+      if (!this.destroyed) {
+        this.showToast("已从回收站恢复");
+      }
+    } catch (error) {
+      console.error("撤销删除失败", error);
+      if (!this.destroyed) {
+        this.showToast("恢复失败，请到回收站重试");
+      }
+    }
+  }
+
+  async restoreSelectedTrash() {
+    const items = this.selectedTrashItems();
+    if (items.length === 0 || this.destroyed) {
+      return;
+    }
+    try {
+      await restoreTrashItems({
+        crypto: this.crypto,
+        key: this.crypto.masterKey,
+        db: this.db,
+        items,
+        existingFolderIds: new Set(
+          this.folders.map((folder) => folder.id)
+        ),
+      });
+      this.selectedTrashIds.clear();
+      await this.refreshRecords();
+      if (!this.destroyed) {
+        this.showToast(`已恢复 ${items.length} 项`);
+      }
+    } catch (error) {
+      console.error("恢复回收站内容失败", error);
+      if (!this.destroyed) {
+        this.showToast("恢复失败，请重试");
+      }
+    }
+  }
+
+  async purgeSelectedTrash() {
+    const items = this.selectedTrashItems();
+    if (items.length === 0 || this.destroyed) {
+      return;
+    }
+    const confirmed = await showConfirm(
+      `确定彻底删除选中的 ${items.length} 项吗？所有加密分块和缩略图都会清除，无法恢复。`,
+      {
+        title: "彻底删除",
+        confirmText: "彻底删除",
+        cancelText: "取消",
+        danger: true,
+        theme: "panel",
+      }
+    );
+    if (!confirmed || this.destroyed) {
+      return;
+    }
+    try {
+      await purgeTrashItems({ db: this.db, items });
+      this.selectedTrashIds.clear();
+      await this.refreshRecords();
+      if (!this.destroyed) {
+        this.showToast("已彻底删除");
+      }
+    } catch (error) {
+      console.error("彻底删除失败", error);
+      if (!this.destroyed) {
+        this.showToast("彻底删除失败，请重试");
+      }
+    }
+  }
+
+  async emptyTrash() {
+    if (this.trashItems.length === 0 || this.destroyed) {
+      return;
+    }
+    const confirmed = await showConfirm(
+      `确定清空回收站中的 ${this.trashItems.length} 项吗？所有加密分块和缩略图都会清除，无法恢复。`,
+      {
+        title: "清空回收站",
+        confirmText: "清空",
+        cancelText: "取消",
+        danger: true,
+        theme: "panel",
+      }
+    );
+    if (!confirmed || this.destroyed) {
+      return;
+    }
+    try {
+      await purgeTrashItems({
+        db: this.db,
+        items: this.trashItems,
+      });
+      this.selectedTrashIds.clear();
+      await this.refreshRecords();
+      if (!this.destroyed) {
+        this.showToast("回收站已清空");
+      }
+    } catch (error) {
+      console.error("清空回收站失败", error);
+      if (!this.destroyed) {
+        this.showToast("清空失败，请重试");
+      }
+    }
+  }
+
   openSettings() {
     if (this.destroyed) {
       return;
@@ -2876,6 +3928,7 @@ export class Panel {
     this.elements.settingsError.textContent = "";
     this.elements.destructError.textContent = "";
     this.elements.settingsForm.reset();
+    this.updatePreferenceControls();
     this.updateDestructControls();
     this.elements.settings.hidden = false;
     window.setTimeout(() => this.elements.oldPin.focus(), 50);
@@ -3115,12 +4168,15 @@ export class Panel {
     }
   }
 
-  showToast(message) {
+  showToast(message, options = {}) {
     if (this.destroyed) {
       return null;
     }
     this.toastController?.hide();
-    this.toastController = showUiToast(message, { theme: "panel" });
+    this.toastController = showUiToast(message, {
+      theme: "panel",
+      ...options,
+    });
     return this.toastController;
   }
 
@@ -3131,6 +4187,7 @@ export class Panel {
     this.destroyed = true;
     window.clearTimeout(this.longPressTimer);
     window.clearTimeout(this.textSaveTimer);
+    window.clearTimeout(this.searchTimer);
     this.longPressTimer = 0;
     this.longPressStart = null;
     this.longPressTriggered = false;
@@ -3138,6 +4195,14 @@ export class Panel {
     this.textDraft = null;
     this.selectionMode = false;
     this.selectedIds.clear();
+    this.selectedTrashIds.clear();
+    if (this.pendingShare) {
+      this.pendingShare.resolve({ status: "cancelled" });
+      this.pendingShare = null;
+    }
+    if (this.exportJob) {
+      this.exportJob.cancelled = true;
+    }
     this.thumbnailObserver?.disconnect();
     this.thumbnailQueue.length = 0;
     this.thumbnailQueued.clear();

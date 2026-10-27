@@ -3,7 +3,7 @@ export const DB_NAME = "calc-data-current";
 const PREVIOUS_DB_NAME = "calc-data";
 // Older installations used this identifier; decode it only for migration.
 const LEGACY_DB_NAME = globalThis.atob("Y2FsY3VsYXRvci1wcml2YXRlLXZhdWx0");
-export const DB_VERSION = 1;
+export const DB_VERSION = 2;
 
 const SOURCE_DB_NAMES = [PREVIOUS_DB_NAME, LEGACY_DB_NAME];
 const ALL_DB_NAMES = [DB_NAME, ...SOURCE_DB_NAMES];
@@ -13,6 +13,9 @@ const COPY_STORES = [
   "thumbs",
   "texts",
   "folders",
+  "trashMeta",
+  "trashTexts",
+  "trashFolders",
   "migration",
 ];
 const PREVIOUS_COPY_MARKER = "previous-database-copied";
@@ -121,6 +124,9 @@ function upgradeDatabase(database) {
   // Text and folder envelopes are encrypted with the same in-memory master key.
   ensureStore(database, "texts", { keyPath: "id" });
   ensureStore(database, "folders", { keyPath: "id" });
+  ensureStore(database, "trashMeta", { keyPath: "id" });
+  ensureStore(database, "trashTexts", { keyPath: "id" });
+  ensureStore(database, "trashFolders", { keyPath: "id" });
   ensureStore(database, "migration", { keyPath: "id" });
 }
 
@@ -574,6 +580,20 @@ export class DataStore {
     await transactionDone(transaction);
   }
 
+  async saveThumbnail(thumbnailEnvelope) {
+    const database = await this.open();
+    const transaction = database.transaction("thumbs", "readwrite");
+    transaction.objectStore("thumbs").put(thumbnailEnvelope);
+    await transactionDone(transaction);
+  }
+
+  async saveMetadata(metaEnvelope) {
+    const database = await this.open();
+    const transaction = database.transaction("meta", "readwrite");
+    transaction.objectStore("meta").put(metaEnvelope);
+    await transactionDone(transaction);
+  }
+
   async getTextEnvelopes() {
     const database = await this.open();
     const transaction = database.transaction("texts", "readonly");
@@ -593,8 +613,12 @@ export class DataStore {
 
   async deleteText(id) {
     const database = await this.open();
-    const transaction = database.transaction("texts", "readwrite");
+    const transaction = database.transaction(
+      ["texts", "trashTexts"],
+      "readwrite"
+    );
     transaction.objectStore("texts").delete(id);
+    transaction.objectStore("trashTexts").delete(id);
     await transactionDone(transaction);
   }
 
@@ -617,15 +641,19 @@ export class DataStore {
 
   async deleteFolder(id) {
     const database = await this.open();
-    const transaction = database.transaction("folders", "readwrite");
+    const transaction = database.transaction(
+      ["folders", "trashFolders"],
+      "readwrite"
+    );
     transaction.objectStore("folders").delete(id);
+    transaction.objectStore("trashFolders").delete(id);
     await transactionDone(transaction);
   }
 
   async deleteMedia(mediaId) {
     const database = await this.open();
     const transaction = database.transaction(
-      ["meta", "thumbs", "chunks"],
+      ["meta", "thumbs", "chunks", "trashMeta"],
       "readwrite"
     );
     const chunks = transaction.objectStore("chunks");
@@ -635,11 +663,118 @@ export class DataStore {
     }
     transaction.objectStore("meta").delete(mediaId);
     transaction.objectStore("thumbs").delete(mediaId);
+    transaction.objectStore("trashMeta").delete(mediaId);
     await transactionDone(transaction);
 
     for (const source of this.#sourceDatabases.values()) {
       await deleteLegacyRecord(source, mediaId);
     }
+  }
+
+  async getTrashMetaEnvelopes() {
+    const database = await this.open();
+    const transaction = database.transaction("trashMeta", "readonly");
+    const records = await requestResult(
+      transaction.objectStore("trashMeta").getAll()
+    );
+    await transactionDone(transaction);
+    return records;
+  }
+
+  async getTrashMetaEnvelope(mediaId) {
+    const database = await this.open();
+    const transaction = database.transaction("trashMeta", "readonly");
+    const record = await requestResult(
+      transaction.objectStore("trashMeta").get(mediaId)
+    );
+    await transactionDone(transaction);
+    return record || null;
+  }
+
+  async getTrashTextEnvelopes() {
+    const database = await this.open();
+    const transaction = database.transaction("trashTexts", "readonly");
+    const records = await requestResult(
+      transaction.objectStore("trashTexts").getAll()
+    );
+    await transactionDone(transaction);
+    return records;
+  }
+
+  async getTrashFolderEnvelopes() {
+    const database = await this.open();
+    const transaction = database.transaction("trashFolders", "readonly");
+    const records = await requestResult(
+      transaction.objectStore("trashFolders").getAll()
+    );
+    await transactionDone(transaction);
+    return records;
+  }
+
+  async moveMediaToTrash(metaEnvelope) {
+    const database = await this.open();
+    const transaction = database.transaction(
+      ["meta", "trashMeta"],
+      "readwrite"
+    );
+    transaction.objectStore("trashMeta").put(metaEnvelope);
+    transaction.objectStore("meta").delete(metaEnvelope.id);
+    await transactionDone(transaction);
+  }
+
+  async moveTextToTrash(envelope) {
+    const database = await this.open();
+    const transaction = database.transaction(
+      ["texts", "trashTexts"],
+      "readwrite"
+    );
+    transaction.objectStore("trashTexts").put(envelope);
+    transaction.objectStore("texts").delete(envelope.id);
+    await transactionDone(transaction);
+  }
+
+  async moveFolderToTrash(envelope) {
+    const database = await this.open();
+    const transaction = database.transaction(
+      ["folders", "trashFolders"],
+      "readwrite"
+    );
+    transaction.objectStore("trashFolders").put(envelope);
+    transaction.objectStore("folders").delete(envelope.id);
+    await transactionDone(transaction);
+  }
+
+  async restoreMedia(envelope) {
+    const database = await this.open();
+    const transaction = database.transaction(
+      ["meta", "trashMeta"],
+      "readwrite"
+    );
+    transaction.objectStore("meta").put(envelope);
+    transaction.objectStore("trashMeta").delete(envelope.id);
+    await transactionDone(transaction);
+  }
+
+  async restoreText(envelope) {
+    const database = await this.open();
+    const transaction = database.transaction(
+      ["texts", "trashTexts"],
+      "readwrite"
+    );
+    transaction.objectStore("texts").put(envelope);
+    transaction.objectStore("trashTexts").delete(envelope.id);
+    await transactionDone(transaction);
+  }
+
+  async restoreFolder(envelope) {
+    const database = await this.open();
+    const transaction = database.transaction(
+      ["folders", "trashFolders"],
+      "readwrite"
+    );
+    transaction.objectStore("folders").put(envelope);
+    transaction.objectStore("trashFolders").delete(envelope.id);
+    await transactionDone(transaction);
   }
 
   async getLegacySummaries() {

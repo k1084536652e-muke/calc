@@ -269,7 +269,13 @@ export function showToast(message, options = {}) {
   element.dataset.theme = options.theme || currentTheme();
   element.setAttribute("role", "status");
   element.setAttribute("aria-live", "polite");
-  element.textContent = message;
+  const copy = document.createElement("span");
+  copy.textContent = message;
+  element.append(copy);
+  element.classList.toggle(
+    "has-action",
+    Boolean(options.actionLabel && options.onAction)
+  );
   layer.append(element);
 
   const duration = Number.isFinite(options.duration) ? options.duration : 3_200;
@@ -288,6 +294,21 @@ export function showToast(message, options = {}) {
   };
   toastController.hide = hide;
   activeToasts.add(toastController);
+
+  if (options.actionLabel && typeof options.onAction === "function") {
+    const action = document.createElement("button");
+    action.type = "button";
+    action.className = "ui-toast-action";
+    action.textContent = options.actionLabel;
+    action.addEventListener("click", () => {
+      if (hidden) {
+        return;
+      }
+      hide();
+      options.onAction();
+    });
+    element.append(action);
+  }
 
   if (duration > 0) {
     timer = window.setTimeout(hide, duration);

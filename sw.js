@@ -1,5 +1,5 @@
 // Increment when cached shell assets change so clients receive the new version.
-const CACHE_VERSION = "v7";
+const CACHE_VERSION = "v9";
 const CACHE_NAME = `finance-shell-${CACHE_VERSION}`;
 const DB_NAME = "calc-data-current";
 const mediaSessions = new Map();
@@ -16,8 +16,12 @@ const SHELL_ASSETS = [
   "./js/finance.js",
   "./js/crypto.js",
   "./js/db.js",
+  "./js/media-export.js",
   "./js/panel.js",
+  "./js/preferences.js",
   "./js/system-panel.js",
+  "./js/thumbnails.js",
+  "./js/trash.js",
   "./icons/icon-192.png",
   "./icons/icon-512.png",
   "./icons/icon-512-maskable.png",
