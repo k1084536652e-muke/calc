@@ -4,6 +4,22 @@ const PREVIOUS_DB_NAME = "calc-data";
 // Older installations used this identifier; decode it only for migration.
 const LEGACY_DB_NAME = globalThis.atob("Y2FsY3VsYXRvci1wcml2YXRlLXZhdWx0");
 export const DB_VERSION = 2;
+const TRASH_PURGE_INDEX_KEY = "trashPurgeIndex";
+const TRASH_PURGE_INDEX_VERSION = 1;
+const TRASH_STORES = {
+  media: {
+    trash: "trashMeta",
+    active: "meta",
+  },
+  text: {
+    trash: "trashTexts",
+    active: "texts",
+  },
+  folder: {
+    trash: "trashFolders",
+    active: "folders",
+  },
+};
 
 const SOURCE_DB_NAMES = [PREVIOUS_DB_NAME, LEGACY_DB_NAME];
 const ALL_DB_NAMES = [DB_NAME, ...SOURCE_DB_NAMES];
@@ -341,6 +357,47 @@ async function deleteLegacyRecord(database, mediaId) {
 async function mediaKeysForTransaction(store, mediaId) {
   const index = store.index("mediaId");
   return requestResult(index.getAllKeys(IDBKeyRange.only(mediaId)));
+}
+
+function trashPurgeEntryKey(entry) {
+  return `${entry.trashType}:${entry.id}`;
+}
+
+function normalizeTrashPurgeEntry(entry) {
+  if (
+    !entry ||
+    typeof entry.id !== "string" ||
+    entry.id.length === 0 ||
+    !TRASH_STORES[entry.trashType] ||
+    !Number.isFinite(entry.expiresAt)
+  ) {
+    return null;
+  }
+  return {
+    id: entry.id,
+    trashType: entry.trashType,
+    expiresAt: entry.expiresAt,
+  };
+}
+
+function trashPurgeEntriesObject(entries) {
+  const result = {};
+  for (const value of Array.isArray(entries) ? entries : []) {
+    const entry = normalizeTrashPurgeEntry(value);
+    if (entry) {
+      result[trashPurgeEntryKey(entry)] = entry;
+    }
+  }
+  return result;
+}
+
+function isCurrentTrashPurgeIndex(index) {
+  return (
+    index?.key === TRASH_PURGE_INDEX_KEY &&
+    index.version === TRASH_PURGE_INDEX_VERSION &&
+    index.entries &&
+    typeof index.entries === "object"
+  );
 }
 
 export class DataStore {
@@ -775,6 +832,172 @@ export class DataStore {
     transaction.objectStore("folders").put(envelope);
     transaction.objectStore("trashFolders").delete(envelope.id);
     await transactionDone(transaction);
+  }
+
+  async getTrashPurgeIndex() {
+    const database = await this.open();
+    const transaction = database.transaction("settings", "readonly");
+    const record = await requestResult(
+      transaction.objectStore("settings").get(TRASH_PURGE_INDEX_KEY)
+    );
+    await transactionDone(transaction);
+    return isCurrentTrashPurgeIndex(record) ? record : null;
+  }
+
+  async upsertTrashPurgeEntries(entries) {
+    const normalized = trashPurgeEntriesObject(entries);
+    if (Object.keys(normalized).length === 0) {
+      return;
+    }
+    const database = await this.open();
+    const transaction = database.transaction("settings", "readwrite");
+    const store = transaction.objectStore("settings");
+    const current = await requestResult(
+      store.get(TRASH_PURGE_INDEX_KEY)
+    );
+    const currentEntries = isCurrentTrashPurgeIndex(current)
+      ? { ...current.entries }
+      : {};
+    store.put({
+      key: TRASH_PURGE_INDEX_KEY,
+      version: TRASH_PURGE_INDEX_VERSION,
+      entries: { ...currentEntries, ...normalized },
+    });
+    await transactionDone(transaction);
+  }
+
+  async removeTrashPurgeEntries(keys) {
+    if (!Array.isArray(keys) || keys.length === 0) {
+      return;
+    }
+    const database = await this.open();
+    const transaction = database.transaction("settings", "readwrite");
+    const store = transaction.objectStore("settings");
+    const current = await requestResult(
+      store.get(TRASH_PURGE_INDEX_KEY)
+    );
+    if (!isCurrentTrashPurgeIndex(current)) {
+      await transactionDone(transaction);
+      return;
+    }
+    const entries = { ...current.entries };
+    for (const key of keys) {
+      delete entries[key];
+    }
+    store.put({
+      key: TRASH_PURGE_INDEX_KEY,
+      version: TRASH_PURGE_INDEX_VERSION,
+      entries,
+    });
+    await transactionDone(transaction);
+  }
+
+  async replaceTrashPurgeIndex(entries) {
+    const database = await this.open();
+    const transaction = database.transaction("settings", "readwrite");
+    transaction.objectStore("settings").put({
+      key: TRASH_PURGE_INDEX_KEY,
+      version: TRASH_PURGE_INDEX_VERSION,
+      entries: trashPurgeEntriesObject(entries),
+    });
+    await transactionDone(transaction);
+  }
+
+  async purgeExpiredTrashByIndex(now = Date.now()) {
+    if (!Number.isFinite(now)) {
+      return 0;
+    }
+    const database = await this.open();
+    const transaction = database.transaction(
+      [
+        "settings",
+        "trashMeta",
+        "trashTexts",
+        "trashFolders",
+        "meta",
+        "texts",
+        "folders",
+        "thumbs",
+        "chunks",
+      ],
+      "readwrite"
+    );
+    const settings = transaction.objectStore("settings");
+    const current = await requestResult(
+      settings.get(TRASH_PURGE_INDEX_KEY)
+    );
+    if (!isCurrentTrashPurgeIndex(current)) {
+      await transactionDone(transaction);
+      return 0;
+    }
+
+    const candidates = Object.entries(current.entries).filter(
+      ([, entry]) => {
+        const normalized = normalizeTrashPurgeEntry(entry);
+        return normalized && normalized.expiresAt <= now;
+      }
+    );
+    if (candidates.length === 0) {
+      await transactionDone(transaction);
+      return 0;
+    }
+
+    const probes = await Promise.all(
+      candidates.map(async ([key, value]) => {
+        const entry = normalizeTrashPurgeEntry(value);
+        const stores = TRASH_STORES[entry.trashType];
+        const trashStore = transaction.objectStore(stores.trash);
+        const activeStore = transaction.objectStore(stores.active);
+        const chunkKeysPromise =
+          entry.trashType === "media"
+            ? mediaKeysForTransaction(
+                transaction.objectStore("chunks"),
+                entry.id
+              )
+            : Promise.resolve([]);
+        const [trashed, active, chunkKeys] = await Promise.all([
+          requestResult(trashStore.get(entry.id)),
+          requestResult(activeStore.get(entry.id)),
+          chunkKeysPromise,
+        ]);
+        return { key, entry, trashed, active, chunkKeys };
+      })
+    );
+
+    const entries = { ...current.entries };
+    let deleted = 0;
+    for (const probe of probes) {
+      if (!probe.trashed) {
+        delete entries[probe.key];
+        continue;
+      }
+      if (probe.active) {
+        continue;
+      }
+
+      if (probe.entry.trashType === "media") {
+        const chunks = transaction.objectStore("chunks");
+        for (const chunkKey of probe.chunkKeys) {
+          chunks.delete(chunkKey);
+        }
+        transaction.objectStore("trashMeta").delete(probe.entry.id);
+        transaction.objectStore("thumbs").delete(probe.entry.id);
+      } else if (probe.entry.trashType === "text") {
+        transaction.objectStore("trashTexts").delete(probe.entry.id);
+      } else {
+        transaction.objectStore("trashFolders").delete(probe.entry.id);
+      }
+      delete entries[probe.key];
+      deleted += 1;
+    }
+
+    settings.put({
+      key: TRASH_PURGE_INDEX_KEY,
+      version: TRASH_PURGE_INDEX_VERSION,
+      entries,
+    });
+    await transactionDone(transaction);
+    return deleted;
   }
 
   async getLegacySummaries() {

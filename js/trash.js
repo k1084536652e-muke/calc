@@ -21,12 +21,39 @@ async function encryptJsonEnvelope(crypto, key, id, payload) {
   };
 }
 
+export function trashPurgeEntryKey(item) {
+  return `${item.trashType}:${item.id}`;
+}
+
+export function buildTrashPurgeEntries(items, retentionDays) {
+  if (retentionDays === null) {
+    return [];
+  }
+  const days = Number(retentionDays);
+  if (!Number.isFinite(days) || days <= 0) {
+    return [];
+  }
+  return items
+    .filter(
+      (item) =>
+        typeof item?.id === "string" &&
+        ["media", "text", "folder"].includes(item.trashType) &&
+        Number.isFinite(item.trashedAt)
+    )
+    .map((item) => ({
+      id: item.id,
+      trashType: item.trashType,
+      expiresAt: item.trashedAt + days * DAY_MS,
+    }));
+}
+
 export async function trashContentRecords({
   crypto,
   key,
   db,
   records,
   folder = null,
+  retentionDays = null,
   now = Date.now(),
 }) {
   if (records.some((record) => record.legacy)) {
@@ -95,6 +122,9 @@ export async function trashContentRecords({
       });
     }
   }
+  await db.upsertTrashPurgeEntries(
+    buildTrashPurgeEntries(trashed, retentionDays)
+  );
   return trashed;
 }
 
@@ -248,6 +278,7 @@ export async function restoreTrashItems({
     }
     restored.push(payload);
   }
+  await db.removeTrashPurgeEntries(items.map(trashPurgeEntryKey));
   return restored;
 }
 
@@ -261,6 +292,7 @@ export async function purgeTrashItems({ db, items }) {
       await db.deleteFolder(item.id);
     }
   }
+  await db.removeTrashPurgeEntries(items.map(trashPurgeEntryKey));
   return items.length;
 }
 

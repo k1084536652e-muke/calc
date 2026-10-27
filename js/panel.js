@@ -47,6 +47,7 @@ import {
   captureVideoThumbnail,
 } from "./thumbnails.js";
 import {
+  buildTrashPurgeEntries,
   getTrashItems,
   purgeExpiredTrash,
   purgeTrashItems,
@@ -524,7 +525,7 @@ export const PANEL_MARKUP = `
           <option value="90">90 天</option>
           <option value="never">从不自动清理</option>
         </select>
-        <p class="field-help">过期内容会在下次解锁时自动彻底删除。</p>
+        <p class="field-help">过期内容会在每次打开应用时自动彻底删除。</p>
       </fieldset>
 
       <fieldset class="settings-block">
@@ -1149,6 +1150,12 @@ export class Panel {
           db: this.db,
         }),
       ]);
+      await this.db.replaceTrashPurgeIndex(
+        buildTrashPurgeEntries(
+          trashItems,
+          this.preferences.trashRetentionDays
+        )
+      );
       const decrypted = (
         await mapWithConcurrency(envelopes, 4, async (envelope) => {
           try {
@@ -1722,6 +1729,7 @@ export class Panel {
           db: this.db,
           records: contents,
           folder,
+          retentionDays: this.preferences.trashRetentionDays,
         });
       } else {
         await removeFolder({
@@ -1967,6 +1975,7 @@ export class Panel {
         key: this.crypto.masterKey,
         db: this.db,
         records,
+        retentionDays: this.preferences.trashRetentionDays,
       });
       if (this.destroyed) {
         return;
@@ -3657,6 +3666,17 @@ export class Panel {
         db: this.db,
         preferences: this.preferences,
       });
+      if (
+        this.preferences.trashRetentionDays !==
+        previous.trashRetentionDays
+      ) {
+        await this.db.replaceTrashPurgeIndex(
+          buildTrashPurgeEntries(
+            this.trashItems,
+            this.preferences.trashRetentionDays
+          )
+        );
+      }
       this.updatePreferenceControls();
     } catch (error) {
       console.error("保存列表偏好失败", error);

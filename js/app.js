@@ -2,6 +2,7 @@ import { DataCrypto } from "./crypto.js";
 import { DataStore } from "./db.js";
 import { FinanceCalculator } from "./finance.js";
 import { Panel } from "./panel.js";
+import { bindBackgroundLockListeners } from "./app-lifecycle.js";
 import {
   beginSystemPanel,
   endSystemPanel,
@@ -23,9 +24,7 @@ let sessionGeneration = 0;
 let setupBusy = false;
 let pendingSetupCode = "";
 let entryReady = false;
-let hiddenPanelReleaseVersion = 0;
-let privacyCoverActive = false;
-let visibilityEpoch = 0;
+let trashPurgeInProgress = false;
 
 const finance = new FinanceCalculator({
   onCode: handleCandidate,
@@ -35,12 +34,10 @@ const finance = new FinanceCalculator({
 });
 
 function showPrivacyCover() {
-  privacyCoverActive = true;
   document.body.classList.add("privacy-cover");
 }
 
 function hidePrivacyCover() {
-  privacyCoverActive = false;
   document.body.classList.remove("privacy-cover");
 }
 
@@ -230,54 +227,38 @@ async function clearAllDataSilently() {
   });
 }
 
-function handleAutoLock() {
-  if (panelOpen) {
-    lockPanel();
+function purgeExpiredTrashInBackground() {
+  if (trashPurgeInProgress || panelOpen) {
+    return;
   }
+  trashPurgeInProgress = true;
+  void database
+    .purgeExpiredTrashByIndex()
+    .catch((error) => {
+      console.error("回收站过期清理失败", error);
+    })
+    .finally(() => {
+      trashPurgeInProgress = false;
+    });
 }
 
-document.addEventListener("visibilitychange", () => {
-  const epoch = ++visibilityEpoch;
-  if (document.visibilityState === "hidden") {
-    if (!panelOpen) {
-      return;
-    }
-    if (isSystemPanelActive()) {
-      hiddenPanelReleaseVersion = getSystemPanelReleaseVersion();
-      showPrivacyCover();
-    } else {
-      handleAutoLock();
-    }
-    return;
-  }
-
-  if (!privacyCoverActive || !panelOpen) {
-    return;
-  }
-
-  void waitForSystemPanelRelease(
-    1_500,
-    hiddenPanelReleaseVersion
-  ).then((released) => {
-    if (epoch !== visibilityEpoch || !panelOpen) {
-      return;
-    }
-    if (released) {
-      hidePrivacyCover();
-    } else {
-      lockPanel();
-    }
-  });
+bindBackgroundLockListeners({
+  documentTarget: document,
+  windowTarget: window,
+  isPanelOpen: () => panelOpen,
+  isDocumentHidden: () => document.visibilityState === "hidden",
+  isSystemPanelActive,
+  getSystemPanelReleaseVersion,
+  showPrivacyCover,
+  hidePrivacyCover,
+  waitForSystemPanelRelease,
+  lockPanel,
+  onVisible: purgeExpiredTrashInBackground,
 });
 
-window.addEventListener("pagehide", handleAutoLock);
-window.addEventListener("blur", () => {
-  if (
-    panelOpen &&
-    document.visibilityState === "visible" &&
-    !isSystemPanelActive()
-  ) {
-    handleAutoLock();
+window.addEventListener("pageshow", (event) => {
+  if (event.persisted) {
+    purgeExpiredTrashInBackground();
   }
 });
 
@@ -295,6 +276,9 @@ async function boot() {
     console.error("读取本地设置失败", error);
   }
 
+  if (storageReady) {
+    purgeExpiredTrashInBackground();
+  }
   entryReady = storageReady;
   finance.setAuthenticated(Boolean(authRecord));
   finance.setEntryReady(storageReady);
