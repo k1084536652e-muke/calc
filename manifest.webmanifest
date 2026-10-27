@@ -1,15 +1,15 @@
 {
   "id": "./",
-  "name": "计算器",
-  "short_name": "计算器",
-  "description": "简洁的计算器",
+  "name": "房贷计算器",
+  "short_name": "房贷计算器",
+  "description": "商业贷款还款测算与月度个税估算工具",
   "lang": "zh-CN",
   "start_url": "./",
   "scope": "./",
   "display": "standalone",
   "orientation": "portrait",
-  "background_color": "#000000",
-  "theme_color": "#000000",
+  "background_color": "#080d17",
+  "theme_color": "#0b1220",
   "icons": [
     {
       "src": "icons/icon-192.png",

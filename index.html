@@ -4,14 +4,14 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
     <meta name="color-scheme" content="dark">
-    <meta name="theme-color" content="#000000">
+    <meta name="theme-color" content="#0b1220">
     <meta name="apple-mobile-web-app-capable" content="yes">
     <meta name="mobile-web-app-capable" content="yes">
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-    <meta name="apple-mobile-web-app-title" content="计算器">
+    <meta name="apple-mobile-web-app-title" content="房贷计算器">
     <meta name="format-detection" content="telephone=no">
     <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' blob: data:; media-src 'self' blob:; connect-src 'self'; worker-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'">
-    <title>计算器</title>
+    <title>房贷计算器 · 商业贷款与个税估算</title>
     <link rel="manifest" href="manifest.webmanifest">
     <link rel="icon" type="image/png" sizes="32x32" href="icons/favicon.png">
     <link rel="apple-touch-icon" sizes="180x180" href="icons/apple-touch-icon.png">
@@ -19,44 +19,230 @@
   </head>
   <body>
     <div class="app-shell">
-      <main id="calculator-view" class="calculator" aria-label="计算器">
-        <section class="calculator-display" aria-live="polite" aria-atomic="true">
-          <div id="expression" class="expression" aria-hidden="true"></div>
-          <output id="display" class="display">0</output>
-        </section>
+      <main id="home-view" class="finance-app" aria-label="房贷计算器">
+        <header class="finance-header">
+          <div class="brand-lockup">
+            <span class="brand-mark" aria-hidden="true">
+              <span class="brand-house"></span>
+            </span>
+            <div>
+              <p class="brand-kicker">本机金融工具</p>
+              <h1>房贷计算器</h1>
+            </div>
+          </div>
+          <p class="header-note">贷款测算与个税估算</p>
+        </header>
 
-        <section id="keypad" class="keypad" aria-label="计算器键盘">
-          <button class="key key-function" type="button" data-action="clear" aria-label="全部清除">AC</button>
-          <button class="key key-function" type="button" data-action="sign" aria-label="正负号">±</button>
-          <button class="key key-function" type="button" data-action="percent" aria-label="百分比">%</button>
-          <button class="key key-operator" type="button" data-operator="/" aria-label="除">÷</button>
+        <nav class="finance-tabs" aria-label="计算类型">
+          <button class="finance-tab is-active" type="button" data-finance-mode="mortgage" aria-selected="true">房贷计算</button>
+          <button class="finance-tab" type="button" data-finance-mode="tax" aria-selected="false">个税计算</button>
+        </nav>
 
-          <button class="key" type="button" data-digit="7" aria-label="七">7</button>
-          <button class="key" type="button" data-digit="8" aria-label="八">8</button>
-          <button class="key" type="button" data-digit="9" aria-label="九">9</button>
-          <button class="key key-operator" type="button" data-operator="*" aria-label="乘">×</button>
+        <div class="finance-content">
+          <section id="mortgage-panel" class="finance-panel" aria-label="商业贷款计算">
+            <form id="mortgage-form" class="tool-card" autocomplete="off" novalidate>
+              <div class="card-heading">
+                <div>
+                  <p class="section-kicker">商业贷款</p>
+                  <h2>还款测算</h2>
+                </div>
+                <span class="card-badge">LPR 参考</span>
+              </div>
 
-          <button class="key" type="button" data-digit="4" aria-label="四">4</button>
-          <button class="key" type="button" data-digit="5" aria-label="五">5</button>
-          <button class="key" type="button" data-digit="6" aria-label="六">6</button>
-          <button class="key key-operator" type="button" data-operator="-" aria-label="减">−</button>
+              <label class="field-label" for="loan-amount">贷款金额</label>
+              <div class="amount-field">
+                <input
+                  id="loan-amount"
+                  type="text"
+                  inputmode="decimal"
+                  maxlength="12"
+                  placeholder="请输入贷款金额"
+                  autocomplete="off"
+                  spellcheck="false"
+                  aria-describedby="loan-amount-error"
+                  data-decimal-input
+                >
+                <span>元</span>
+              </div>
+              <p id="loan-amount-error" class="field-error" role="status" aria-live="polite"></p>
 
-          <button class="key" type="button" data-digit="1" aria-label="一">1</button>
-          <button class="key" type="button" data-digit="2" aria-label="二">2</button>
-          <button class="key" type="button" data-digit="3" aria-label="三">3</button>
-          <button class="key key-operator" type="button" data-operator="+" aria-label="加">+</button>
+              <div class="field-grid">
+                <div>
+                  <label class="field-label" for="loan-years">贷款年限</label>
+                  <div class="amount-field amount-field-short">
+                    <input
+                      id="loan-years"
+                      type="text"
+                      inputmode="numeric"
+                      maxlength="2"
+                      value="30"
+                      autocomplete="off"
+                      aria-describedby="loan-years-error"
+                    >
+                    <span>年</span>
+                  </div>
+                  <p id="loan-years-error" class="field-error" role="status" aria-live="polite"></p>
+                </div>
+                <div>
+                  <label class="field-label" for="loan-rate">年利率</label>
+                  <div class="amount-field amount-field-short">
+                    <input
+                      id="loan-rate"
+                      type="text"
+                      inputmode="decimal"
+                      maxlength="5"
+                      value="3.10"
+                      autocomplete="off"
+                      aria-describedby="loan-rate-error"
+                    >
+                    <span>%</span>
+                  </div>
+                  <p id="loan-rate-error" class="field-error" role="status" aria-live="polite"></p>
+                </div>
+              </div>
 
-          <button class="key key-zero" type="button" data-digit="0" aria-label="零">0</button>
-          <button class="key" type="button" data-action="decimal" aria-label="小数点">.</button>
-          <button class="key key-operator" type="button" data-action="equals" aria-label="等于">=</button>
-        </section>
+              <span class="field-label">还款方式</span>
+              <div class="repayment-toggle" role="group" aria-label="还款方式">
+                <button class="repayment-option is-active" type="button" data-repayment="equal-payment" aria-pressed="true">等额本息</button>
+                <button class="repayment-option" type="button" data-repayment="equal-principal" aria-pressed="false">等额本金</button>
+              </div>
+
+              <button id="mortgage-submit" class="calculate-button" type="submit" disabled>计算</button>
+              <p id="setup-hint" class="setup-hint" hidden>首次使用：在贷款金额中输入 4–8 位数字并计算，完成本机偏好设置（建议 6–8 位）</p>
+            </form>
+
+            <section id="mortgage-result" class="result-card" aria-live="polite" hidden>
+              <div class="result-heading">
+                <div>
+                  <p class="section-kicker">测算结果</p>
+                  <h2>商业贷款概览</h2>
+                </div>
+                <span class="result-icon" aria-hidden="true">¥</span>
+              </div>
+              <p id="result-summary" class="result-summary"></p>
+              <dl class="result-list">
+                <div class="result-row result-row-primary">
+                  <dt id="result-monthly-label">每月月供</dt>
+                  <dd><output id="result-monthly" class="fit-output"></output><span class="result-unit">元</span></dd>
+                </div>
+                <div id="result-decrease-row" class="result-row" hidden>
+                  <dt>每月递减</dt>
+                  <dd><output id="result-decrease" class="fit-output"></output><span class="result-unit">元</span></dd>
+                </div>
+                <div class="result-row">
+                  <dt>支付总利息</dt>
+                  <dd><output id="result-interest" class="fit-output"></output><span class="result-unit">元</span></dd>
+                </div>
+                <div class="result-row">
+                  <dt>还款总额</dt>
+                  <dd><output id="result-total" class="fit-output"></output><span class="result-unit">元</span></dd>
+                </div>
+              </dl>
+            </section>
+          </section>
+
+          <section id="tax-panel" class="finance-panel" aria-label="个税估算" hidden>
+            <form id="tax-form" class="tool-card" autocomplete="off" novalidate>
+              <div class="card-heading">
+                <div>
+                  <p class="section-kicker">工资薪金</p>
+                  <h2>月度个税估算</h2>
+                </div>
+                <span class="card-badge">按月估算</span>
+              </div>
+
+              <label class="field-label" for="tax-income">月收入</label>
+              <div class="amount-field">
+                <input
+                  id="tax-income"
+                  type="text"
+                  inputmode="decimal"
+                  maxlength="12"
+                  placeholder="请输入税前月收入"
+                  autocomplete="off"
+                  spellcheck="false"
+                  aria-describedby="tax-income-error"
+                  data-decimal-input
+                >
+                <span>元</span>
+              </div>
+              <p id="tax-income-error" class="field-error" role="status" aria-live="polite"></p>
+
+              <label class="field-label" for="tax-insurance">五险一金</label>
+              <div class="amount-field">
+                <input
+                  id="tax-insurance"
+                  type="text"
+                  inputmode="decimal"
+                  maxlength="12"
+                  value="0"
+                  placeholder="0.00"
+                  autocomplete="off"
+                  spellcheck="false"
+                  aria-describedby="tax-insurance-error"
+                  data-decimal-input
+                >
+                <span>元</span>
+              </div>
+              <p id="tax-insurance-error" class="field-error" role="status" aria-live="polite"></p>
+
+              <label class="field-label" for="tax-deduction">专项附加扣除</label>
+              <div class="amount-field">
+                <input
+                  id="tax-deduction"
+                  type="text"
+                  inputmode="decimal"
+                  maxlength="12"
+                  value="0"
+                  placeholder="0.00"
+                  autocomplete="off"
+                  spellcheck="false"
+                  aria-describedby="tax-deduction-error"
+                  data-decimal-input
+                >
+                <span>元</span>
+              </div>
+              <p id="tax-deduction-error" class="field-error" role="status" aria-live="polite"></p>
+
+              <button id="tax-submit" class="calculate-button" type="submit">计算个税</button>
+            </form>
+
+            <section id="tax-result" class="result-card" aria-live="polite" hidden>
+              <div class="result-heading">
+                <div>
+                  <p class="section-kicker">估算结果</p>
+                  <h2>月度个税概览</h2>
+                </div>
+                <span class="result-icon" aria-hidden="true">税</span>
+              </div>
+              <dl class="result-list">
+                <div class="result-row">
+                  <dt>应纳税所得额</dt>
+                  <dd><output id="tax-taxable" class="fit-output"></output><span class="result-unit">元</span></dd>
+                </div>
+                <div class="result-row result-row-primary">
+                  <dt>应缴个税</dt>
+                  <dd><output id="tax-payable" class="fit-output"></output><span class="result-unit">元</span></dd>
+                </div>
+                <div class="result-row">
+                  <dt>税后收入</dt>
+                  <dd><output id="tax-after-income" class="fit-output"></output><span class="result-unit">元</span></dd>
+                </div>
+              </dl>
+              <p class="tax-estimate-note">按月度税率表估算；实际工资预扣采用累计预扣法，年初月份预扣额会较低</p>
+            </section>
+          </section>
+
+          <p class="finance-disclaimer">结果依据输入参数估算，实际金额以贷款机构或税务申报结果为准。</p>
+        </div>
       </main>
 
-      <div id="vault-root"></div>
+      <div id="panel-root" class="panel-root"></div>
+      <div id="ui-layer" class="ui-layer"></div>
     </div>
 
     <noscript>
-      <p class="noscript-message">请启用 JavaScript 后使用计算器。</p>
+      <p class="noscript-message">请启用 JavaScript 后使用房贷计算器。</p>
     </noscript>
 
     <script type="module" src="js/app.js"></script>
