@@ -24,8 +24,20 @@ function normalizePreferences(value = {}) {
 
 export async function loadPreferences({ crypto, key, db }) {
   const record = await db.getSetting(PREFERENCES_KEY);
-  if (!record?.ciphertext || !record?.iv) {
-    return { ...DEFAULT_PREFERENCES };
+  if (!record) {
+    return {
+      preferences: { ...DEFAULT_PREFERENCES },
+      status: "missing",
+    };
+  }
+  if (!record.ciphertext || !record.iv) {
+    return {
+      preferences: {
+        ...DEFAULT_PREFERENCES,
+        trashRetentionDays: null,
+      },
+      status: "failed",
+    };
   }
   try {
     const payload = await crypto.decryptJson(
@@ -37,11 +49,26 @@ export async function loadPreferences({ crypto, key, db }) {
       payload?.type !== "preferences" ||
       payload.schemaVersion !== PREFERENCES_SCHEMA_VERSION
     ) {
-      return { ...DEFAULT_PREFERENCES };
+      return {
+        preferences: {
+          ...DEFAULT_PREFERENCES,
+          trashRetentionDays: null,
+        },
+        status: "failed",
+      };
     }
-    return normalizePreferences(payload);
+    return {
+      preferences: normalizePreferences(payload),
+      status: "ok",
+    };
   } catch {
-    return { ...DEFAULT_PREFERENCES };
+    return {
+      preferences: {
+        ...DEFAULT_PREFERENCES,
+        trashRetentionDays: null,
+      },
+      status: "failed",
+    };
   }
 }
 

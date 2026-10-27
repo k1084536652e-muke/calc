@@ -1,5 +1,5 @@
 // Increment when cached shell assets change so clients receive the new version.
-const CACHE_VERSION = "v10";
+const CACHE_VERSION = "v11";
 const CACHE_NAME = `finance-shell-${CACHE_VERSION}`;
 const DB_NAME = "calc-data-current";
 const mediaSessions = new Map();

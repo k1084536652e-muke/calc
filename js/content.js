@@ -1,6 +1,55 @@
-import { encryptMetadata } from "./archive.js";
+import {
+  decryptMetadata,
+  encryptMetadata,
+} from "./archive.js";
 
 export const CONTENT_SCHEMA_VERSION = 1;
+
+const MEDIA_EXTENSION_TYPES = new Map([
+  ["image/jpeg", ".jpg"],
+  ["image/png", ".png"],
+  ["image/heic", ".heic"],
+  ["image/gif", ".gif"],
+  ["image/webp", ".webp"],
+  ["video/mp4", ".mp4"],
+  ["video/quicktime", ".mov"],
+]);
+
+export function splitMediaName(name, mimeType = "") {
+  const value = String(name || "");
+  const dotIndex = value.lastIndexOf(".");
+  if (dotIndex > 0) {
+    const candidate = value.slice(dotIndex + 1);
+    if (/^[A-Za-z0-9]{1,10}$/.test(candidate)) {
+      return {
+        base: value.slice(0, dotIndex),
+        ext: value.slice(dotIndex),
+      };
+    }
+  }
+  const normalizedMime = String(mimeType)
+    .split(";", 1)[0]
+    .trim()
+    .toLowerCase();
+  return {
+    base: value,
+    ext: MEDIA_EXTENSION_TYPES.get(normalizedMime) || "",
+  };
+}
+
+export function validateMediaBaseName(value, ext = "") {
+  const base = String(value || "").trim();
+  if (!base || base === "." || base === "..") {
+    return "请输入名称";
+  }
+  if (/[/\\\u0000-\u001f\u007f]/.test(base)) {
+    return "名称不能包含 / 或 \\";
+  }
+  if (`${base}${ext}`.length > 90) {
+    return "名称过长";
+  }
+  return "";
+}
 
 export function contentId() {
   if (typeof globalThis.crypto?.randomUUID === "function") {
@@ -132,6 +181,37 @@ export async function moveContentRecords({
     moved.push(metadata);
   }
   return moved;
+}
+
+/**
+ * Re-encrypts media metadata while leaving chunks and thumbnails untouched.
+ * Returns null when the active record changed or no longer exists.
+ */
+export async function renameMediaRecord({
+  crypto,
+  key,
+  db,
+  id,
+  name,
+  now = Date.now(),
+}) {
+  const currentEnvelope = await db.getMetaEnvelope(id);
+  if (!currentEnvelope) {
+    return null;
+  }
+  if (await db.getTrashMetaEnvelope?.(id)) {
+    return null;
+  }
+  const current = await decryptMetadata(crypto, key, currentEnvelope);
+  const metadata = {
+    ...current,
+    name,
+    updatedAt: now,
+  };
+  await db.saveMetadata(
+    await encryptMetadata(crypto, key, metadata)
+  );
+  return metadata;
 }
 
 export async function deleteContentRecords({ db, records }) {

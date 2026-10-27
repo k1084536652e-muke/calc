@@ -25,9 +25,12 @@ import {
   decryptFolder,
   decryptText,
   moveContentRecords,
+  renameMediaRecord,
   removeFolder,
   saveFolder,
   saveText,
+  splitMediaName,
+  validateMediaBaseName,
 } from "./content.js";
 import {
   LARGE_EXPORT_CONFIRM_MESSAGE,
@@ -49,9 +52,9 @@ import {
 import {
   buildTrashPurgeEntries,
   getTrashItems,
-  purgeExpiredTrash,
   purgeTrashItems,
   restoreTrashItems,
+  syncTrashOnUnlock,
   trashContentRecords,
   trashRemainingDays,
 } from "./trash.js";
@@ -481,6 +484,7 @@ export const PANEL_MARKUP = `
 
     <footer id="selection-actions" class="selection-actions" hidden>
       <button id="select-all-button" type="button">全选</button>
+      <button type="button" data-selection-action="rename" hidden>重命名</button>
       <button type="button" data-selection-action="export">存储/分享</button>
       <button type="button" data-selection-action="move">移动到…</button>
       <button class="is-danger" type="button" data-selection-action="delete">删除</button>
@@ -574,6 +578,7 @@ export const PANEL_MARKUP = `
   <section id="media-viewer" class="media-viewer" role="dialog" aria-modal="true" aria-labelledby="viewer-title" hidden>
     <h2 id="viewer-title" class="visually-hidden"></h2>
     <button class="viewer-close viewer-back" type="button" data-viewer-action="close">返回</button>
+    <button class="viewer-close viewer-rename" type="button" data-viewer-action="rename">重命名</button>
     <div class="viewer-body">
       <button class="viewer-nav viewer-nav-previous" type="button" data-viewer-action="previous" aria-label="上一张">‹</button>
       <div id="viewer-stage" class="viewer-stage"></div>
@@ -621,6 +626,7 @@ export class Panel {
     this.trashItems = [];
     this.selectedTrashIds = new Set();
     this.preferences = { showNames: true, trashRetentionDays: 30 };
+    this.preferencesUnavailable = false;
     this.searchQuery = "";
     this.contentFilter = "all";
     this.searchTimer = 0;
@@ -767,6 +773,9 @@ export class Panel {
       ),
       viewerNext: this.root.querySelector('[data-viewer-action="next"]'),
       viewerBack: this.root.querySelector('[data-viewer-action="close"]'),
+      viewerRename: this.root.querySelector(
+        '[data-viewer-action="rename"]'
+      ),
       selectionActions: byId("selection-actions"),
       selectAllButton: byId("select-all-button"),
       trash: byId("trash-panel"),
@@ -839,6 +848,8 @@ export class Panel {
           void this.switchViewer(-1);
         } else if (action === "next") {
           void this.switchViewer(1);
+        } else if (action === "rename") {
+          void this.renameViewerRecord();
         }
         return;
       }
@@ -872,6 +883,8 @@ export class Panel {
         const action = selectionButton.dataset.selectionAction;
         if (action === "export") {
           void this.exportSelected();
+        } else if (action === "rename") {
+          void this.renameSelected();
         } else if (action === "move") {
           void this.moveSelected();
         } else if (action === "delete") {
@@ -1120,15 +1133,19 @@ export class Panel {
     }
     this.thumbnailFailed.clear();
     try {
-      this.preferences = await loadPreferences({
+      const preferenceState = await loadPreferences({
         crypto: this.crypto,
         key: this.crypto.masterKey,
         db: this.db,
       });
-      await purgeExpiredTrash({
+      this.preferences = preferenceState.preferences;
+      this.preferencesUnavailable =
+        preferenceState.status === "failed";
+      const { trashItems } = await syncTrashOnUnlock({
         crypto: this.crypto,
         key: this.crypto.masterKey,
         db: this.db,
+        preferencesStatus: preferenceState.status,
         retentionDays: this.preferences.trashRetentionDays,
       });
       const [
@@ -1137,25 +1154,13 @@ export class Panel {
         textEnvelopes,
         folderEnvelopes,
         destructRecord,
-        trashItems,
       ] = await Promise.all([
         this.db.getMetaEnvelopes(),
         this.db.getLegacySummaries(),
         this.db.getTextEnvelopes(),
         this.db.getFolderEnvelopes(),
         this.db.getSetting("destruct"),
-        getTrashItems({
-          crypto: this.crypto,
-          key: this.crypto.masterKey,
-          db: this.db,
-        }),
       ]);
-      await this.db.replaceTrashPurgeIndex(
-        buildTrashPurgeEntries(
-          trashItems,
-          this.preferences.trashRetentionDays
-        )
-      );
       const decrypted = (
         await mapWithConcurrency(envelopes, 4, async (envelope) => {
           try {
@@ -1599,6 +1604,19 @@ export class Panel {
     this.elements.selectAllButton.textContent = allSelected
       ? "取消全选"
       : "全选";
+    const selected = this.selectedRecords();
+    const canRename =
+      selected.length === 1 &&
+      !selected[0].legacy &&
+      ["image", "video"].includes(selected[0].kind);
+    const renameButton = this.elements.selectionActions.querySelector(
+      '[data-selection-action="rename"]'
+    );
+    renameButton.hidden = !canRename;
+    this.elements.selectionActions.classList.toggle(
+      "has-rename",
+      canRename
+    );
     for (const button of this.elements.selectionActions.querySelectorAll(
       "[data-selection-action]"
     )) {
@@ -1610,6 +1628,97 @@ export class Panel {
     return this.records.filter((record) =>
       this.selectedIds.has(record.id)
     );
+  }
+
+  mediaCanRename(record) {
+    return Boolean(
+      record &&
+        !record.legacy &&
+        ["image", "video"].includes(record.kind)
+    );
+  }
+
+  async renameMediaRecordFromPrompt(record) {
+    if (this.destroyed || !this.mediaCanRename(record)) {
+      return false;
+    }
+    const { base, ext } = splitMediaName(
+      record.name,
+      record.mimeType
+    );
+    const value = await showPrompt("输入新的名称", {
+      title: "重命名",
+      suffix: ext,
+      defaultValue: base,
+      maxLength: Math.max(1, 90 - ext.length),
+      theme: "panel",
+      validate: (input) => validateMediaBaseName(input, ext),
+    });
+    if (value === null || this.destroyed) {
+      return false;
+    }
+    const name = `${value.trim()}${ext}`;
+    if (name === record.name) {
+      return false;
+    }
+    try {
+      const saved = await renameMediaRecord({
+        crypto: this.crypto,
+        key: this.crypto.masterKey,
+        db: this.db,
+        id: record.id,
+        name,
+      });
+      if (!saved) {
+        if (!this.destroyed) {
+          this.showToast("内容已变化，请重试");
+        }
+        return false;
+      }
+      if (this.destroyed) {
+        return false;
+      }
+      this.records = this.records.map((item) =>
+        item.id === saved.id ? { ...saved, legacy: false } : item
+      );
+      if (this.viewerRecord?.id === saved.id) {
+        this.viewerRecord = { ...saved, legacy: false };
+        this.elements.viewerTitle.textContent = saved.name;
+        const media = this.elements.viewerStage.querySelector("img");
+        if (media) {
+          media.alt = saved.name;
+        }
+      }
+      this.rebuildSearchIndex();
+      this.renderGrid();
+      this.showToast("已重命名");
+      return true;
+    } catch (error) {
+      console.error("重命名失败", error);
+      if (!this.destroyed) {
+        this.showToast("重命名失败，请重试");
+      }
+      return false;
+    }
+  }
+
+  async renameViewerRecord() {
+    const record = this.viewerRecord;
+    if (!record || !this.mediaCanRename(record)) {
+      return;
+    }
+    await this.renameMediaRecordFromPrompt(record);
+  }
+
+  async renameSelected() {
+    const selected = this.selectedRecords();
+    if (
+      selected.length !== 1 ||
+      !this.mediaCanRename(selected[0])
+    ) {
+      return;
+    }
+    await this.renameMediaRecordFromPrompt(selected[0]);
   }
 
   async createFolder() {
@@ -1729,7 +1838,9 @@ export class Panel {
           db: this.db,
           records: contents,
           folder,
-          retentionDays: this.preferences.trashRetentionDays,
+          retentionDays: this.preferencesUnavailable
+            ? null
+            : this.preferences.trashRetentionDays,
         });
       } else {
         await removeFolder({
@@ -1975,7 +2086,9 @@ export class Panel {
         key: this.crypto.masterKey,
         db: this.db,
         records,
-        retentionDays: this.preferences.trashRetentionDays,
+        retentionDays: this.preferencesUnavailable
+          ? null
+          : this.preferences.trashRetentionDays,
       });
       if (this.destroyed) {
         return;
@@ -2494,10 +2607,16 @@ export class Panel {
   }
 
   safeFilename(value) {
-    return String(value || "")
+    const sanitized = String(value || "")
       .replace(/[\\/:*?"<>|\u0000-\u001f]/g, "_")
-      .trim()
-      .slice(0, 90);
+      .trim();
+    if (sanitized.length <= 90) {
+      return sanitized;
+    }
+    const { base, ext } = splitMediaName(sanitized);
+    return ext
+      ? `${base.slice(0, 90 - ext.length)}${ext}`
+      : sanitized.slice(0, 90);
   }
 
   scheduleThumbnail(record, image) {
@@ -2875,6 +2994,7 @@ export class Panel {
     }
     this.viewerRecord = record;
     this.elements.viewerTitle.textContent = record.name;
+    this.elements.viewerRename.hidden = record.legacy === true;
     this.resetViewerTransform();
     this.elements.viewer.classList.add("controls-visible");
     this.elements.viewerStage.classList.toggle(
@@ -3657,6 +3777,11 @@ export class Panel {
 
   async updatePreferences(changes) {
     const previous = { ...this.preferences };
+    const previousUnavailable = this.preferencesUnavailable;
+    const retentionSettingChanged = Object.prototype.hasOwnProperty.call(
+      changes,
+      "trashRetentionDays"
+    );
     this.preferences = { ...this.preferences, ...changes };
     this.renderGrid();
     try {
@@ -3666,9 +3791,18 @@ export class Panel {
         db: this.db,
         preferences: this.preferences,
       });
-      if (
+      if (retentionSettingChanged) {
+        this.preferencesUnavailable = false;
+        await this.db.replaceTrashPurgeIndex(
+          buildTrashPurgeEntries(
+            this.trashItems,
+            this.preferences.trashRetentionDays
+          )
+        );
+      } else if (
+        !previousUnavailable &&
         this.preferences.trashRetentionDays !==
-        previous.trashRetentionDays
+          previous.trashRetentionDays
       ) {
         await this.db.replaceTrashPurgeIndex(
           buildTrashPurgeEntries(
@@ -3681,6 +3815,7 @@ export class Panel {
     } catch (error) {
       console.error("保存列表偏好失败", error);
       this.preferences = previous;
+      this.preferencesUnavailable = previousUnavailable;
       this.updatePreferenceControls();
       if (!this.destroyed) {
         this.showToast("设置保存失败，请重试");
@@ -3751,7 +3886,11 @@ export class Panel {
       );
       detail.textContent = [
         `删除于 ${formatDate(item.trashedAt)}`,
-        remaining === null ? "不自动清理" : `剩余 ${remaining} 天`,
+        this.preferencesUnavailable
+          ? "自动清理已暂停"
+          : remaining === null
+            ? "不自动清理"
+            : `剩余 ${remaining} 天`,
         item.storageSize ? formatSize(item.storageSize) : "",
       ]
         .filter(Boolean)
@@ -3771,9 +3910,11 @@ export class Panel {
     );
     this.elements.trashSummary.textContent =
       `${this.trashItems.length} 项 · 内容约 ${formatSize(bytes)} · ` +
-      (this.preferences.trashRetentionDays === null
-        ? "不自动清理"
-        : `${this.preferences.trashRetentionDays} 天后自动清理`);
+      (this.preferencesUnavailable
+        ? "自动清理已暂停"
+        : this.preferences.trashRetentionDays === null
+          ? "不自动清理"
+          : `${this.preferences.trashRetentionDays} 天后自动清理`);
     this.updateTrashSelectionUi();
   }
 

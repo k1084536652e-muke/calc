@@ -318,6 +318,34 @@ export async function purgeExpiredTrash({
   });
 }
 
+export async function syncTrashOnUnlock({
+  crypto,
+  key,
+  db,
+  preferencesStatus,
+  retentionDays,
+  now = Date.now(),
+}) {
+  if (preferencesStatus === "failed") {
+    return {
+      trashItems: await getTrashItems({ crypto, key, db }),
+      paused: true,
+    };
+  }
+  await purgeExpiredTrash({
+    crypto,
+    key,
+    db,
+    retentionDays,
+    now,
+  });
+  const trashItems = await getTrashItems({ crypto, key, db });
+  await db.replaceTrashPurgeIndex(
+    buildTrashPurgeEntries(trashItems, retentionDays)
+  );
+  return { trashItems, paused: false };
+}
+
 export function trashRemainingDays(item, retentionDays, now = Date.now()) {
   if (retentionDays === null) {
     return null;

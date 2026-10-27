@@ -55,6 +55,7 @@ function createDialog({
   input,
   choices,
   cancelValue,
+  suffix = "",
   theme = currentTheme(),
 }) {
   const layer = getLayer();
@@ -71,7 +72,14 @@ function createDialog({
       </div>
       <p class="ui-dialog-message"></p>
       <div class="ui-dialog-input-wrap" hidden>
-        <input class="ui-dialog-input" autocomplete="off">
+        ${
+          suffix
+            ? `<div class="ui-dialog-input-row">
+                <input class="ui-dialog-input" autocomplete="off">
+                <span class="ui-dialog-suffix"></span>
+              </div>`
+            : '<input class="ui-dialog-input" autocomplete="off">'
+        }
         <p class="ui-dialog-error" role="status" aria-live="polite"></p>
       </div>
       <div class="ui-dialog-actions"></div>
@@ -83,6 +91,7 @@ function createDialog({
   const messageElement = element.querySelector(".ui-dialog-message");
   const inputWrap = element.querySelector(".ui-dialog-input-wrap");
   const inputElement = element.querySelector(".ui-dialog-input");
+  const suffixElement = element.querySelector(".ui-dialog-suffix");
   const inputError = element.querySelector(".ui-dialog-error");
   const actions = element.querySelector(".ui-dialog-actions");
   const cancelButton = document.createElement("button");
@@ -123,6 +132,9 @@ function createDialog({
 
   if (input) {
     inputWrap.hidden = false;
+    if (suffixElement) {
+      suffixElement.textContent = suffix;
+    }
     inputElement.type = input.type || "text";
     inputElement.placeholder = input.placeholder || "";
     inputElement.value = input.defaultValue || "";
@@ -239,6 +251,7 @@ export function showPrompt(message, options = {}) {
     cancelText: options.cancelText || "取消",
     theme: options.theme,
     cancelValue: null,
+    suffix: options.suffix || "",
     input: {
       type: options.inputType || "text",
       placeholder: options.placeholder || "",
