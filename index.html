@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+    <meta name="color-scheme" content="dark">
+    <meta name="theme-color" content="#000000">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <meta name="apple-mobile-web-app-title" content="计算器">
+    <meta name="format-detection" content="telephone=no">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' blob: data:; media-src 'self' blob:; connect-src 'self'; worker-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'">
+    <title>计算器</title>
+    <link rel="manifest" href="manifest.webmanifest">
+    <link rel="icon" type="image/png" sizes="32x32" href="icons/favicon.png">
+    <link rel="apple-touch-icon" sizes="180x180" href="icons/apple-touch-icon.png">
+    <link rel="stylesheet" href="styles.css">
+  </head>
+  <body>
+    <div class="app-shell">
+      <main id="calculator-view" class="calculator" aria-label="计算器">
+        <section class="calculator-display" aria-live="polite" aria-atomic="true">
+          <div id="expression" class="expression" aria-hidden="true"></div>
+          <output id="display" class="display">0</output>
+        </section>
+
+        <section id="keypad" class="keypad" aria-label="计算器键盘">
+          <button class="key key-function" type="button" data-action="clear" aria-label="全部清除">AC</button>
+          <button class="key key-function" type="button" data-action="sign" aria-label="正负号">±</button>
+          <button class="key key-function" type="button" data-action="percent" aria-label="百分比">%</button>
+          <button class="key key-operator" type="button" data-operator="/" aria-label="除">÷</button>
+
+          <button class="key" type="button" data-digit="7" aria-label="七">7</button>
+          <button class="key" type="button" data-digit="8" aria-label="八">8</button>
+          <button class="key" type="button" data-digit="9" aria-label="九">9</button>
+          <button class="key key-operator" type="button" data-operator="*" aria-label="乘">×</button>
+
+          <button class="key" type="button" data-digit="4" aria-label="四">4</button>
+          <button class="key" type="button" data-digit="5" aria-label="五">5</button>
+          <button class="key" type="button" data-digit="6" aria-label="六">6</button>
+          <button class="key key-operator" type="button" data-operator="-" aria-label="减">−</button>
+
+          <button class="key" type="button" data-digit="1" aria-label="一">1</button>
+          <button class="key" type="button" data-digit="2" aria-label="二">2</button>
+          <button class="key" type="button" data-digit="3" aria-label="三">3</button>
+          <button class="key key-operator" type="button" data-operator="+" aria-label="加">+</button>
+
+          <button class="key key-zero" type="button" data-digit="0" aria-label="零">0</button>
+          <button class="key" type="button" data-action="decimal" aria-label="小数点">.</button>
+          <button class="key key-operator" type="button" data-action="equals" aria-label="等于">=</button>
+        </section>
+      </main>
+
+      <div id="vault-root"></div>
+    </div>
+
+    <noscript>
+      <p class="noscript-message">请启用 JavaScript 后使用计算器。</p>
+    </noscript>
+
+    <script type="module" src="js/app.js"></script>
+  </body>
+</html>
