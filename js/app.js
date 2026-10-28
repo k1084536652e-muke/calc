@@ -11,6 +11,16 @@ import {
   waitForSystemPanelRelease,
 } from "./system-panel.js";
 import { closeAllDialogs } from "./dialogs.js";
+import { APP_VERSION } from "./version-info.js";
+import {
+  initializeNewUserData,
+  runMigrations,
+} from "./migrations.js";
+import {
+  loadPreferences,
+  savePreferences,
+  shouldShowUpdateToast,
+} from "./preferences.js";
 
 const panelRoot = document.querySelector("#panel-root");
 const cryptoManager = new DataCrypto();
@@ -25,6 +35,32 @@ let setupBusy = false;
 let pendingSetupCode = "";
 let entryReady = false;
 let trashPurgeInProgress = false;
+let albumThemePreference = "night";
+let lockPromise = null;
+
+const systemThemeQuery = window.matchMedia?.(
+  "(prefers-color-scheme: dark)"
+);
+
+function applyAlbumTheme(preference) {
+  albumThemePreference = ["system", "day", "night"].includes(preference)
+    ? preference
+    : "night";
+  const resolved =
+    globalThis.CalcTheme?.resolvePreference(albumThemePreference) ||
+    (albumThemePreference === "day" ? "day" : "night");
+  globalThis.CalcTheme?.applyResolved(resolved);
+}
+
+function restoreCalculatorTheme() {
+  globalThis.CalcTheme?.applyCalculatorTheme();
+}
+
+systemThemeQuery?.addEventListener?.("change", () => {
+  if (panelOpen && albumThemePreference === "system") {
+    applyAlbumTheme("system");
+  }
+});
 
 const finance = new FinanceCalculator({
   onCode: handleCandidate,
@@ -42,50 +78,124 @@ function hidePrivacyCover() {
 }
 
 function lockPanel() {
+  if (lockPromise) {
+    return lockPromise;
+  }
   sessionGeneration += 1;
   panelOpen = false;
   closeAllDialogs();
+  const panelToClose = activePanel;
+  activePanel = null;
+  showPrivacyCover();
 
-  if (activePanel) {
-    activePanel.destroy();
-    activePanel = null;
-  }
-  panelRoot.replaceChildren();
-  cryptoManager.lock();
-  document.body.classList.remove("panel-open");
-  document.body.classList.remove("panel-viewer-open");
-  hidePrivacyCover();
-  finance.clearLoanInput();
-  finance.setBusy(false);
-  finance.setAuthenticated(Boolean(authRecord));
+  lockPromise = (async () => {
+    try {
+      await panelToClose?.flushBeforeLock?.();
+    } catch (error) {
+      console.error("锁定前保存失败", error);
+    } finally {
+      panelToClose?.destroy();
+      panelRoot.replaceChildren();
+      cryptoManager.lock();
+      restoreCalculatorTheme();
+      document.body.classList.remove("panel-open");
+      document.body.classList.remove("panel-viewer-open");
+      hidePrivacyCover();
+      finance.clearLoanInput();
+      finance.setBusy(false);
+      finance.setAuthenticated(Boolean(authRecord));
+      lockPromise = null;
+    }
+  })();
+  return lockPromise;
 }
 
-function openPanel(session) {
-  cryptoManager.installKey(session.key);
-  finance.clearLoanInput();
-  finance.setAuthenticated(true);
-  panelOpen = true;
-  hidePrivacyCover();
-  sessionGeneration += 1;
-  document.body.classList.add("panel-open");
-
-  activePanel = new Panel({
-    host: panelRoot,
-    cryptoManager,
-    database,
-    auth: authRecord,
-    legacyKey: session.legacyKey || null,
-    onLock: lockPanel,
-    onAuthUpdated: (newAuth) => {
-      authRecord = newAuth;
-      finance.setAuthenticated(true);
-    },
-    onDestructUpdated: (record) => {
-      destructRecord = record;
-    },
+async function showVersionUpdateIfNeeded() {
+  const preferenceState = await loadPreferences({
+    crypto: cryptoManager,
+    key: cryptoManager.masterKey,
+    db: database,
   });
+  if (!shouldShowUpdateToast(preferenceState, APP_VERSION)) {
+    return;
+  }
+  activePanel?.showToast(`已更新到 ${APP_VERSION}`);
+  try {
+    const saved = await savePreferences({
+      crypto: cryptoManager,
+      key: cryptoManager.masterKey,
+      db: database,
+      preferences: {
+        ...preferenceState.preferences,
+        lastSeenAppVersion: APP_VERSION,
+      },
+    });
+    if (activePanel) {
+      activePanel.preferences = saved;
+    }
+  } catch (error) {
+    console.error("保存已读版本失败", error);
+  }
+}
 
-  void activePanel.mount();
+async function openPanel(session) {
+  cryptoManager.installKey(session.key);
+  try {
+    const migration = await runMigrations({
+      db: database,
+      crypto: cryptoManager,
+      key: session.key,
+    });
+    const preferenceState = await loadPreferences({
+      crypto: cryptoManager,
+      key: session.key,
+      db: database,
+    });
+    applyAlbumTheme(
+      preferenceState.status === "ok"
+        ? preferenceState.preferences.albumTheme
+        : "night"
+    );
+
+    finance.clearLoanInput();
+    finance.setAuthenticated(true);
+    panelOpen = true;
+    hidePrivacyCover();
+    sessionGeneration += 1;
+    document.body.classList.add("panel-open");
+
+    activePanel = new Panel({
+      host: panelRoot,
+      cryptoManager,
+      database,
+      auth: authRecord,
+      legacyKey: session.legacyKey || null,
+      appVersion: APP_VERSION,
+      onLock: lockPanel,
+      onAuthUpdated: (newAuth) => {
+        authRecord = newAuth;
+        finance.setAuthenticated(true);
+      },
+      onDestructUpdated: (record) => {
+        destructRecord = record;
+      },
+      onAlbumThemeChanged: (preference) => {
+        applyAlbumTheme(preference);
+      },
+    });
+
+    await activePanel.mount();
+    if (migration.status === "failed") {
+      activePanel.showToast(
+        "数据升级未完成，下次解锁时将重试"
+      );
+    } else {
+      await showVersionUpdateIfNeeded();
+    }
+  } catch (error) {
+    lockPanel();
+    throw error;
+  }
 }
 
 async function tryUnlock(candidate) {
@@ -111,7 +221,7 @@ async function tryUnlock(candidate) {
     return false;
   }
 
-  openPanel(session);
+  await openPanel(session);
   return true;
 }
 
@@ -162,10 +272,21 @@ async function handleCandidate(candidate) {
   try {
     const { auth, key } = await cryptoManager.createCredentials(code);
     await database.saveAuth(auth);
+    try {
+      await initializeNewUserData({
+        db: database,
+        crypto: cryptoManager,
+        key,
+        appVersion: APP_VERSION,
+      });
+    } catch (error) {
+      await database.deleteSetting("auth").catch(() => {});
+      throw error;
+    }
     authRecord = auth;
     pendingSetupCode = "";
     finance.setAuthenticated(true);
-    openPanel({ key, legacyKey: null, auth });
+    await openPanel({ key, legacyKey: null, auth });
     return true;
   } catch (error) {
     console.error("首次设置失败", error);
@@ -195,6 +316,7 @@ async function clearAllDataSilently() {
   document.body.classList.remove("panel-open");
   document.body.classList.remove("panel-viewer-open");
   hidePrivacyCover();
+  restoreCalculatorTheme();
   navigator.serviceWorker?.controller?.postMessage({
     type: "clear-media-keys",
   });

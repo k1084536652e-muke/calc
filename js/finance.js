@@ -166,16 +166,28 @@ function fitOutputText(element) {
   const computed = getComputedStyle(element);
   let size = Number.parseFloat(computed.fontSize);
   const minimum = 12;
-  const characterCount = Math.max(1, element.textContent.length);
-  const availableWidth = Math.max(1, element.clientWidth);
-  const estimatedFit = availableWidth / (characterCount * 0.62);
-  if (estimatedFit < size) {
-    size = Math.max(minimum, estimatedFit);
-    element.style.fontSize = `${size}px`;
-  }
+  const parent = element.parentElement;
+  const parentWidth = Math.max(1, parent?.clientWidth || 0);
+  const reservedWidth = [...(parent?.children || [])].reduce(
+    (width, child) => {
+      if (child === element) {
+        return width;
+      }
+      const style = getComputedStyle(child);
+      return (
+        width +
+        child.getBoundingClientRect().width +
+        (Number.parseFloat(style.marginLeft) || 0) +
+        (Number.parseFloat(style.marginRight) || 0)
+      );
+    },
+    0
+  );
+  const availableWidth = Math.max(1, parentWidth - reservedWidth);
   let attempts = 0;
   while (
     (element.scrollWidth > element.clientWidth + 1 ||
+      element.scrollWidth > availableWidth + 1 ||
       element.scrollHeight > element.clientHeight + 1) &&
     size > minimum &&
     attempts < 30
@@ -188,7 +200,9 @@ function fitOutputText(element) {
 
 function setFieldError(input, errorElement, message) {
   errorElement.textContent = message;
+  errorElement.hidden = !message;
   input.setAttribute("aria-invalid", message ? "true" : "false");
+  input.closest(".frow")?.classList.toggle("err", Boolean(message));
 }
 
 export class FinanceCalculator {
@@ -208,6 +222,7 @@ export class FinanceCalculator {
       mortgageTab: document.querySelector('[data-finance-mode="mortgage"]'),
       taxPanel: document.querySelector("#tax-panel"),
       taxTab: document.querySelector('[data-finance-mode="tax"]'),
+      calcTitle: document.querySelector("#calc-title"),
       loanAmount: document.querySelector("#loan-amount"),
       loanError: document.querySelector("#loan-amount-error"),
       years: document.querySelector("#loan-years"),
@@ -217,6 +232,7 @@ export class FinanceCalculator {
       repaymentButtons: document.querySelectorAll("[data-repayment]"),
       mortgageSubmit: document.querySelector("#mortgage-submit"),
       mortgageResult: document.querySelector("#mortgage-result"),
+      resultTerm: document.querySelector("#result-term"),
       resultMonthlyLabel: document.querySelector("#result-monthly-label"),
       resultMonthly: document.querySelector("#result-monthly"),
       resultDecreaseRow: document.querySelector("#result-decrease-row"),
@@ -327,7 +343,14 @@ export class FinanceCalculator {
     );
     this.elements.taxTab.setAttribute("aria-selected", String(!isMortgage));
     this.elements.mortgageTab.classList.toggle("is-active", isMortgage);
+    this.elements.mortgageTab.classList.toggle("on", isMortgage);
     this.elements.taxTab.classList.toggle("is-active", !isMortgage);
+    this.elements.taxTab.classList.toggle("on", !isMortgage);
+    if (this.elements.calcTitle) {
+      this.elements.calcTitle.textContent = isMortgage
+        ? "房贷计算"
+        : "个税计算";
+    }
     requestAnimationFrame(() => this.fitResults());
     if (typeof this.onModeChange === "function") {
       this.onModeChange(mode);
@@ -338,6 +361,7 @@ export class FinanceCalculator {
     for (const button of this.elements.repaymentButtons) {
       const selected = button.dataset.repayment === this.repayment;
       button.classList.toggle("is-active", selected);
+      button.classList.toggle("on", selected);
       button.setAttribute("aria-pressed", String(selected));
     }
   }
@@ -375,7 +399,7 @@ export class FinanceCalculator {
 
   setTaxBusy(busy) {
     this.elements.taxSubmit.disabled = busy;
-    this.elements.taxSubmit.textContent = busy ? "正在计算…" : "计算个税";
+    this.elements.taxSubmit.textContent = busy ? "正在计算…" : "计算";
   }
 
   clearLoanInput() {
@@ -476,6 +500,9 @@ export class FinanceCalculator {
           repayment: this.repayment,
         });
         const isEqualPrincipal = this.repayment === "equal-principal";
+        this.elements.resultTerm.textContent = `${
+          isEqualPrincipal ? "等额本金" : "等额本息"
+        } · ${result.months} 期`;
         this.elements.resultMonthlyLabel.textContent = isEqualPrincipal
           ? "首月月供"
           : "每月月供";
@@ -492,9 +519,9 @@ export class FinanceCalculator {
         this.elements.resultTotal.textContent = formatMoney(
           result.totalPayment
         );
-        this.elements.resultSummary.textContent = `贷款 ${formatPrincipal(
+        this.elements.resultSummary.textContent = `贷款本金 ${formatPrincipal(
           loanAmount
-        )} 元 · ${years} 年 · 年利率 ${formatRate(rate)}`;
+        )} 元`;
         this.elements.mortgageResult.hidden = false;
         requestAnimationFrame(() => this.fitResults());
       } catch (error) {

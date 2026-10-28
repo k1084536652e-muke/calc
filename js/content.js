@@ -2,8 +2,19 @@ import {
   decryptMetadata,
   encryptMetadata,
 } from "./archive.js";
+import {
+  htmlToPlainText,
+  textBodyToHtml,
+  textRecordForDisplay,
+} from "./text-content.js";
 
 export const CONTENT_SCHEMA_VERSION = 1;
+export const TEXT_SCHEMA_VERSION = 2;
+
+const SUPPORTED_VERSIONS = Object.freeze({
+  folder: [CONTENT_SCHEMA_VERSION],
+  text: [CONTENT_SCHEMA_VERSION, TEXT_SCHEMA_VERSION],
+});
 
 const MEDIA_EXTENSION_TYPES = new Map([
   ["image/jpeg", ".jpg"],
@@ -69,7 +80,15 @@ function envelope(id, encrypted) {
 }
 
 function textPayload(text) {
-  return {
+  const requestedVersion = Number(text.schemaVersion);
+  const schemaVersion =
+    requestedVersion === TEXT_SCHEMA_VERSION
+      ? TEXT_SCHEMA_VERSION
+      : CONTENT_SCHEMA_VERSION;
+  if (!SUPPORTED_VERSIONS.text.includes(requestedVersion || CONTENT_SCHEMA_VERSION)) {
+    throw new Error("不支持的文本格式");
+  }
+  const payload = {
     id: text.id,
     type: "text",
     kind: "text",
@@ -78,8 +97,20 @@ function textPayload(text) {
     createdAt: Number(text.createdAt) || Date.now(),
     updatedAt: Number(text.updatedAt) || Date.now(),
     folderId: text.folderId ?? null,
-    schemaVersion: CONTENT_SCHEMA_VERSION,
+    schemaVersion,
   };
+  if (schemaVersion === TEXT_SCHEMA_VERSION) {
+    payload.format = "html";
+    payload.html = String(
+      text.html ??
+        textBodyToHtml(payload.body)
+    );
+    payload.body =
+      text.body === undefined
+        ? htmlToPlainText(payload.html)
+        : String(text.body);
+  }
+  return payload;
 }
 
 function folderPayload(folder) {
@@ -94,11 +125,12 @@ function folderPayload(folder) {
 }
 
 function validateEnvelope(record, expectedId, expectedType) {
+  const versions = SUPPORTED_VERSIONS[expectedType] || [];
   if (
     !record ||
     record.id !== expectedId ||
-    record.schemaVersion !== CONTENT_SCHEMA_VERSION ||
-    record.type !== expectedType
+    record.type !== expectedType ||
+    !versions.includes(record.schemaVersion)
   ) {
     throw new Error("不支持的内容格式");
   }
@@ -118,7 +150,35 @@ export async function decryptText({ crypto, key, envelope: record }) {
     record.iv,
     key
   );
-  return validateEnvelope(payload, record.id, "text");
+  return textRecordForDisplay(
+    validateEnvelope(payload, record.id, "text")
+  );
+}
+
+export async function renameTextRecord({
+  crypto,
+  key,
+  db,
+  id,
+  title,
+  now = Date.now(),
+}) {
+  const envelopes = await db.getTextEnvelopes();
+  const envelope = envelopes.find((item) => item.id === id);
+  if (!envelope) {
+    return null;
+  }
+  const current = await decryptText({ crypto, key, envelope });
+  return saveText({
+    crypto,
+    key,
+    db,
+    text: {
+      ...current,
+      title,
+      updatedAt: now,
+    },
+  });
 }
 
 export async function saveFolder({ crypto, key, db, folder }) {

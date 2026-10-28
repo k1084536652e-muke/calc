@@ -1,6 +1,7 @@
-// Increment when cached shell assets change so clients receive the new version.
-const CACHE_VERSION = "v11";
-const CACHE_NAME = `finance-shell-${CACHE_VERSION}`;
+importScripts("./js/version.js");
+// app-version: 2.0.0
+const APP_VERSION = self.CALC_VERSION.app;
+const CACHE_NAME = `finance-shell-${APP_VERSION}`;
 const DB_NAME = "calc-data-current";
 const mediaSessions = new Map();
 
@@ -9,20 +10,48 @@ const SHELL_ASSETS = [
   "./index.html",
   "./styles.css",
   "./manifest.webmanifest",
-  "./js/app.js",
   "./js/app-lifecycle.js",
+  "./js/app.js",
   "./js/archive.js",
   "./js/content.js",
-  "./js/dialogs.js",
-  "./js/finance.js",
   "./js/crypto.js",
   "./js/db.js",
+  "./js/dialogs.js",
+  "./js/document-editor.js",
+  "./js/finance.js",
+  "./js/icons.js",
   "./js/media-export.js",
+  "./js/migrations.js",
   "./js/panel.js",
   "./js/preferences.js",
+  "./js/sanitize.js",
   "./js/system-panel.js",
+  "./js/text-content.js",
+  "./js/theme-boot.js",
   "./js/thumbnails.js",
   "./js/trash.js",
+  "./js/ui/folder-cover.js",
+  "./js/ui/long-press.js",
+  "./js/ui/paging.js",
+  "./js/ui/search.js",
+  "./js/ui/selection.js",
+  "./js/ui/settings.js",
+  "./js/ui/thumbnail-cache.js",
+  "./js/ui/trash-format.js",
+  "./js/version-info.js",
+  "./js/version.js",
+  "./js/video.js",
+  "./vendor/dompurify/LICENSE",
+  "./vendor/dompurify/purify.es.mjs",
+  "./vendor/lucide/LICENSE",
+  "./vendor/plyr/LICENSE.md",
+  "./vendor/plyr/blank.mp4",
+  "./vendor/plyr/plyr.css",
+  "./vendor/plyr/plyr.min.js",
+  "./vendor/plyr/plyr.svg",
+  "./vendor/tiptap/LICENSE",
+  "./vendor/tiptap/THIRD_PARTY_NOTICES.txt",
+  "./vendor/tiptap/tiptap.bundle.js",
   "./icons/icon-192.png?v=10",
   "./icons/icon-512.png?v=10",
   "./icons/icon-512-maskable.png?v=10",
@@ -58,7 +87,10 @@ self.addEventListener("activate", (event) => {
       .then((keys) =>
         Promise.all(
           keys
-            .filter((key) => key !== CACHE_NAME)
+            .filter(
+              (key) =>
+                key.startsWith("finance-shell-") && key !== CACHE_NAME
+            )
             .map((key) => caches.delete(key))
         )
       )

@@ -1,11 +1,35 @@
 export const PREFERENCES_KEY = "preferences";
-export const PREFERENCES_SCHEMA_VERSION = 1;
+export const PREFERENCES_SCHEMA_VERSION = 2;
+export const ALBUM_THEMES = Object.freeze(["system", "day", "night"]);
 export const DEFAULT_PREFERENCES = Object.freeze({
   showNames: true,
   trashRetentionDays: 30,
+  albumTheme: "night",
+  lastSeenAppVersion: "",
 });
 
-function normalizePreferences(value = {}) {
+function failedPreferences() {
+  return {
+    ...DEFAULT_PREFERENCES,
+    trashRetentionDays: null,
+  };
+}
+
+function normalizeAlbumTheme(value) {
+  return ALBUM_THEMES.includes(value) ? value : "night";
+}
+
+function normalizeLastSeenAppVersion(value, schemaVersion) {
+  if (typeof value === "string" && value.trim()) {
+    return value.trim().slice(0, 64);
+  }
+  return schemaVersion === 1 ? "1.9.0" : "";
+}
+
+export function normalizePreferences(
+  value = {},
+  schemaVersion = PREFERENCES_SCHEMA_VERSION
+) {
   const requestedRetention = value.trashRetentionDays;
   const trashRetentionDays =
     requestedRetention === null
@@ -19,6 +43,11 @@ function normalizePreferences(value = {}) {
         ? value.showNames
         : DEFAULT_PREFERENCES.showNames,
     trashRetentionDays,
+    albumTheme: normalizeAlbumTheme(value.albumTheme),
+    lastSeenAppVersion: normalizeLastSeenAppVersion(
+      value.lastSeenAppVersion,
+      schemaVersion
+    ),
   };
 }
 
@@ -32,10 +61,7 @@ export async function loadPreferences({ crypto, key, db }) {
   }
   if (!record.ciphertext || !record.iv) {
     return {
-      preferences: {
-        ...DEFAULT_PREFERENCES,
-        trashRetentionDays: null,
-      },
+      preferences: failedPreferences(),
       status: "failed",
     };
   }
@@ -47,33 +73,38 @@ export async function loadPreferences({ crypto, key, db }) {
     );
     if (
       payload?.type !== "preferences" ||
-      payload.schemaVersion !== PREFERENCES_SCHEMA_VERSION
+      ![1, PREFERENCES_SCHEMA_VERSION].includes(payload.schemaVersion)
     ) {
       return {
-        preferences: {
-          ...DEFAULT_PREFERENCES,
-          trashRetentionDays: null,
-        },
+        preferences: failedPreferences(),
         status: "failed",
       };
     }
     return {
-      preferences: normalizePreferences(payload),
+      preferences: normalizePreferences(
+        payload,
+        payload.schemaVersion
+      ),
       status: "ok",
     };
   } catch {
     return {
-      preferences: {
-        ...DEFAULT_PREFERENCES,
-        trashRetentionDays: null,
-      },
+      preferences: failedPreferences(),
       status: "failed",
     };
   }
 }
 
-export async function savePreferences({ crypto, key, db, preferences }) {
-  const normalized = normalizePreferences(preferences);
+export async function savePreferences({
+  crypto,
+  key,
+  db,
+  preferences,
+}) {
+  const normalized = normalizePreferences(
+    preferences,
+    PREFERENCES_SCHEMA_VERSION
+  );
   const encrypted = await crypto.encryptJson(
     {
       type: "preferences",
@@ -88,4 +119,16 @@ export async function savePreferences({ crypto, key, db, preferences }) {
     ciphertext: encrypted.ciphertext,
   });
   return normalized;
+}
+
+export function shouldShowUpdateToast(
+  preferenceState,
+  appVersion
+) {
+  return (
+    preferenceState?.status === "ok" &&
+    typeof appVersion === "string" &&
+    appVersion.length > 0 &&
+    preferenceState.preferences?.lastSeenAppVersion !== appVersion
+  );
 }
