@@ -1,5 +1,5 @@
 /**
- * 视频封面（2.1.5）
+ * 视频封面（2.1.6）
  *
  * 设计（与用户确认一致）：
  *  1. **导入时**从原始 File 的 blob: URL 取一帧小 JPEG（与照片缩略图同级），加密进 thumbs；
@@ -14,7 +14,7 @@
  *  - requestVideoFrameCallback 等到真正出帧再 drawImage。
  */
 
-export const COVER_GEN = 5;
+export const COVER_GEN = 6;
 const DEFAULT_TIMEOUT = 12000;
 /** 懒补时允许整份解密取帧的上限（legacy 或退回路径） */
 export const LEGACY_INLINE_MAX = 12 * 1024 * 1024;
@@ -90,10 +90,92 @@ function drawToJpeg(source, w, h) {
   });
 }
 
+/** 纯黑/近匀色/过小 JPEG 一律当失败（不落盘当封面） */
 function isBlankFrame(shot) {
   if (!shot || !shot.thumb) return true;
-  if (shot.bright >= 2) return false;
-  return !(shot.variance >= 4);
+  if (shot.thumb.length < 280) return true;          /* 极小 JPEG ≈ 空图 */
+  if (shot.variance < 4) return true;                /* 近匀色（含白/灰/黑） */
+  return false;
+}
+
+/** 已存缩略图是否「像真封面」：字节、尺寸、方差 */
+export function thumbLooksValid(insp) {
+  if (!insp || !insp.bytes) return false;
+  if (insp.bytes < 280) return false;
+  if (insp.w < 8 || insp.h < 8) return false;
+  if (insp.variance < 4) return false;
+  return true;
+}
+
+/**
+ * 分析已解密缩略图字节：mime 嗅探 + 解码宽高 + 平均色/方差 + 可展示的 blob URL。
+ * 调用方负责 revoke previewUrl。
+ */
+export async function inspectThumbBytes(bytes) {
+  const empty = {
+    bytes: 0, mime: null, w: 0, h: 0,
+    avgR: 0, avgG: 0, avgB: 0, bright: 0, variance: 0,
+    uniform: true, tiny: true, ok: false, previewUrl: null, decodeOk: false,
+  };
+  if (!bytes || !bytes.length) return empty;
+  const u8 = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+  let mime = "application/octet-stream";
+  if (u8.length >= 3 && u8[0] === 0xff && u8[1] === 0xd8 && u8[2] === 0xff) mime = "image/jpeg";
+  else if (u8.length >= 8 && u8[0] === 0x89 && u8[1] === 0x50 && u8[2] === 0x4e && u8[3] === 0x47) mime = "image/png";
+  else if (u8.length >= 12 && u8[0] === 0x52 && u8[1] === 0x49 && u8[2] === 0x46 && u8[3] === 0x46) mime = "image/webp";
+  const blob = new Blob([u8], { type: mime === "application/octet-stream" ? "image/jpeg" : mime });
+  const previewUrl = URL.createObjectURL(blob);
+  const out = {
+    bytes: u8.length, mime, w: 0, h: 0,
+    avgR: 0, avgG: 0, avgB: 0, bright: 0, variance: 0,
+    uniform: true, tiny: u8.length < 280, ok: false, previewUrl, decodeOk: false,
+  };
+  try {
+    let bmp = null;
+    if (typeof createImageBitmap === "function") {
+      try { bmp = await createImageBitmap(blob); } catch { bmp = null; }
+    }
+    if (bmp) {
+      out.w = bmp.width; out.h = bmp.height; out.decodeOk = true;
+      const c = document.createElement("canvas");
+      const tw = Math.min(64, bmp.width || 1);
+      const th = Math.min(64, bmp.height || 1);
+      c.width = tw; c.height = th;
+      const ctx = c.getContext("2d", { willReadFrequently: true });
+      ctx.drawImage(bmp, 0, 0, tw, th);
+      try { bmp.close(); } catch { /* */ }
+      const d = ctx.getImageData(0, 0, tw, th).data;
+      let sr = 0, sg = 0, sb = 0, n = 0;
+      const lum = [];
+      for (let i = 0; i < d.length; i += 4) {
+        sr += d[i]; sg += d[i + 1]; sb += d[i + 2];
+        lum.push((d[i] + d[i + 1] + d[i + 2]) / 3);
+        n++;
+      }
+      out.avgR = n ? Math.round(sr / n) : 0;
+      out.avgG = n ? Math.round(sg / n) : 0;
+      out.avgB = n ? Math.round(sb / n) : 0;
+      out.bright = lum.length ? lum.reduce((a, b) => a + b, 0) / lum.length : 0;
+      let ss = 0;
+      for (const v of lum) { const dv = v - out.bright; ss += dv * dv; }
+      out.variance = lum.length ? ss / lum.length : 0;
+      out.uniform = out.variance < 4;
+    } else {
+      /* 无 createImageBitmap：用 Image 解码拿尺寸（方差暂未知，按能解码算候选） */
+      await new Promise((resolve) => {
+        const img = new Image();
+        img.onload = () => {
+          out.w = img.naturalWidth; out.h = img.naturalHeight; out.decodeOk = true;
+          resolve();
+        };
+        img.onerror = () => resolve();
+        img.src = previewUrl;
+      });
+      if (out.decodeOk) { out.uniform = false; out.variance = 999; }
+    }
+  } catch { /* */ }
+  out.ok = thumbLooksValid(out) && out.decodeOk;
+  return out;
 }
 
 function makeCaptureVideo() {
@@ -108,9 +190,17 @@ function makeCaptureVideo() {
   video.controls = false;
   try { video.disablePictureInPicture = true; } catch { /* */ }
   try { video.disableRemotePlayback = true; } catch { /* */ }
-  // 真实尺寸 + 极低透明：WebKit 对 1×1 / opacity:0 / 未入 DOM 不出可绘帧
-  video.style.cssText = "position:fixed;left:0;top:0;width:160px;height:90px;opacity:0.01;pointer-events:none;z-index:-1;border:0;";
-  if (document.body) document.body.appendChild(video);
+  /* iOS：opacity≈0 / 离屏时常不出可绘帧。用全不透明 + 同尺寸遮罩盖住，用户看不见播放画面。 */
+  const wrap = document.createElement("div");
+  wrap.setAttribute("data-cover-cap", "1");
+  wrap.style.cssText = "position:fixed;left:0;top:0;width:176px;height:100px;z-index:2147483000;overflow:hidden;pointer-events:none;";
+  const shield = document.createElement("div");
+  shield.style.cssText = "position:absolute;inset:0;background:#0a0a0a;z-index:1;";
+  video.style.cssText = "position:absolute;left:0;top:0;width:176px;height:100px;opacity:1;z-index:0;border:0;object-fit:contain;background:#000;";
+  wrap.appendChild(video);
+  wrap.appendChild(shield);
+  if (document.body) document.body.appendChild(wrap);
+  video._capWrap = wrap;
   return video;
 }
 
@@ -120,10 +210,70 @@ function cleanupVideo(video, url) {
       try { video.pause(); } catch { /* */ }
       video.removeAttribute("src");
       try { video.load(); } catch { /* */ }
-      video.remove();
+      const wrap = video._capWrap;
+      if (wrap && wrap.parentNode) wrap.remove();
+      else video.remove();
     }
   } catch { /* */ }
   try { if (url) URL.revokeObjectURL(url); } catch { /* */ }
+}
+
+/** 多帧 rVFC：给 iOS 多几次真正出帧的机会 */
+async function waitFrames(video, n, eachMs) {
+  for (let i = 0; i < n; i++) {
+    const ok = await waitForFrame(video, eachMs);
+    if (!ok) break;
+  }
+}
+
+/** drawImage；若空白再试 createImageBitmap(video) */
+async function drawFromVideo(video, w, h) {
+  let shot = await drawToJpeg(video, w, h);
+  if (!isBlankFrame(shot)) return shot;
+  if (typeof createImageBitmap === "function") {
+    try {
+      const bmp = await createImageBitmap(video);
+      try {
+        shot = await drawToJpeg(bmp, bmp.width || w, bmp.height || h);
+      } finally {
+        try { bmp.close(); } catch { /* */ }
+      }
+    } catch { /* */ }
+  }
+  return shot;
+}
+
+/**
+ * 空白则换时间点重试：~0.1s → 0.5s → 1s，并多等几帧。
+ * 仍只读开头几秒，绝不整段播放大视频。
+ */
+async function captureShots(video, out, budget) {
+  const dur = out.dur;
+  const cand = [frameTime(dur), 0.5, 1.0];
+  const times = [];
+  for (const t of cand) {
+    if (times.includes(t)) continue;
+    if (Number.isFinite(dur) && dur > 0 && t >= dur) continue;
+    times.push(t);
+  }
+  let last = null;
+  for (const t of times) {
+    const seeked = waitEvent(video, ["seeked"], Math.min(budget, 5000));
+    try { video.currentTime = t; } catch { /* */ }
+    await seeked;
+    await waitFrames(video, 3, Math.min(budget, 1500));
+    try { video.pause(); } catch { /* */ }
+    last = await drawFromVideo(video, out.w, out.h);
+    if (!isBlankFrame(last)) return last;
+    try {
+      await video.play();
+      await waitFrames(video, 3, 1200);
+      video.pause();
+      last = await drawFromVideo(video, out.w, out.h);
+      if (!isBlankFrame(last)) return last;
+    } catch { /* */ }
+  }
+  return last;
 }
 
 /**
@@ -178,24 +328,7 @@ export function beginCapture(file, { mime } = {}) {
       out.dur = Number.isFinite(video.duration) ? video.duration : null;
       if (!out.w || !out.h) return { ...out, reason: "nocodec" };
 
-      await waitForFrame(video, Math.min(budget, 4000));
-      const target = frameTime(out.dur);
-      const seeked = waitEvent(video, ["seeked"], Math.min(budget, 5000));
-      try { video.currentTime = target; } catch { /* */ }
-      await seeked;
-      await waitForFrame(video, Math.min(budget, 4000));
-      try { video.pause(); } catch { /* */ }
-
-      let shot = await drawToJpeg(video, out.w, out.h);
-      if (isBlankFrame(shot)) {
-        // 再短促 play 一次（仍只在 0.1s 附近）
-        try {
-          await video.play();
-          await waitForFrame(video, 2500);
-          video.pause();
-          shot = await drawToJpeg(video, out.w, out.h);
-        } catch { /* */ }
-      }
+      let shot = await captureShots(video, out, budget);
       if (isBlankFrame(shot)) return { ...out, reason: "blank", ms: Date.now() - out.t0 };
       out.thumb = shot.thumb;
       out.ms = Date.now() - out.t0;
@@ -246,22 +379,25 @@ export async function captureCoverFromUrl(src, mime, { timeout = DEFAULT_TIMEOUT
     out.dur = Number.isFinite(video.duration) ? video.duration : null;
     if (!out.w || !out.h) return { ...out, reason: "nocodec" };
 
-    await waitForFrame(video, Math.min(timeout, 4000));
-    const target = at == null ? frameTime(out.dur) : at;
-    const seeked = waitEvent(video, ["seeked"], Math.min(timeout, 5000));
-    try { video.currentTime = target; } catch { /* */ }
-    await seeked;
-    await waitForFrame(video, Math.min(timeout, 4000));
-    try { video.pause(); } catch { /* */ }
-
-    let shot = await drawToJpeg(video, out.w, out.h);
-    if (isBlankFrame(shot)) {
-      try {
-        await video.play();
-        await waitForFrame(video, 2500);
-        video.pause();
-        shot = await drawToJpeg(video, out.w, out.h);
-      } catch { /* */ }
+    /* at 显式指定时只试该点；否则走 0.1/0.5/1s 多点重试 */
+    let shot;
+    if (at != null) {
+      const seeked = waitEvent(video, ["seeked"], Math.min(timeout, 5000));
+      try { video.currentTime = at; } catch { /* */ }
+      await seeked;
+      await waitFrames(video, 3, Math.min(timeout, 1500));
+      try { video.pause(); } catch { /* */ }
+      shot = await drawFromVideo(video, out.w, out.h);
+      if (isBlankFrame(shot)) {
+        try {
+          await video.play();
+          await waitFrames(video, 3, 1200);
+          video.pause();
+          shot = await drawFromVideo(video, out.w, out.h);
+        } catch { /* */ }
+      }
+    } else {
+      shot = await captureShots(video, out, timeout);
     }
     if (isBlankFrame(shot)) return { ...out, reason: "blank", ms: Date.now() - out.t0 };
     out.thumb = shot.thumb;
@@ -398,27 +534,105 @@ export async function backfillVideoCovers(vault, {
 
 export function _resetBackfillSession() { sessionFailed.clear(); sessionGen = COVER_GEN; }
 
-/** 诊断：列出缺封面 / 失败条目（不含明文、不含密钥） */
-export function diagnoseCovers(vault) {
+/**
+ * 诊断：对每条视频读出缩略图字节并分析（不含明文视频、不含密钥）。
+ * 返回的 previewUrl 由调用方在关闭对话框时 revoke。
+ */
+export async function diagnoseCovers(vault) {
   const items = (vault && vault.items) || [];
   const videos = items.filter((it) => it.kind === "video" && !it.trashedAt);
-  return {
-    coverGen: COVER_GEN,
-    totalVideos: videos.length,
-    withThumb: videos.filter((it) => it.hasThumb).length,
-    missing: videos.filter((it) => !it.hasThumb).length,
-    rows: videos.map((it) => ({
+  const rows = [];
+  for (const it of videos) {
+    let insp = null;
+    let readErr = null;
+    if (it.hasThumb) {
+      try {
+        const bytes = await vault.readThumb(it.id);
+        insp = await inspectThumbBytes(bytes);
+      } catch (err) {
+        readErr = (err && err.name) || "readerr";
+        insp = await inspectThumbBytes(null);
+      }
+    } else {
+      insp = await inspectThumbBytes(null);
+    }
+    const valid = !!(insp && insp.ok);
+    rows.push({
       id: it.id,
       name: it.name,
       size: it.size,
       mime: it.mime,
       hasThumb: !!it.hasThumb,
+      validCover: valid,
       dur: it.dur,
       w: it.w, h: it.h,
       coverFail: it.coverFail || null,
       coverFailGen: it.coverFailGen || null,
       coverFailAt: it.coverFailAt || null,
       coverFailMs: it.coverFailMs || null,
-    })),
+      thumbBytes: insp ? insp.bytes : 0,
+      thumbMime: insp ? insp.mime : null,
+      thumbW: insp ? insp.w : 0,
+      thumbH: insp ? insp.h : 0,
+      avgR: insp ? insp.avgR : 0,
+      avgG: insp ? insp.avgG : 0,
+      avgB: insp ? insp.avgB : 0,
+      bright: insp ? Math.round(insp.bright) : 0,
+      variance: insp ? Math.round(insp.variance) : 0,
+      uniform: !!(insp && insp.uniform),
+      tiny: !!(insp && insp.tiny),
+      decodeOk: !!(insp && insp.decodeOk),
+      previewUrl: insp ? insp.previewUrl : null,
+      readErr,
+      hypothesis: !it.hasThumb ? "no-record"
+        : readErr ? "decrypt-fail"
+        : !(insp && insp.decodeOk) ? "bad-bytes-or-mime"
+        : (insp && insp.tiny) ? "tiny"
+        : (insp && insp.uniform) ? "uniform-blank"
+        : valid ? "ok-should-show" : "unknown",
+    });
+  }
+  const withRecord = rows.filter((r) => r.hasThumb).length;
+  const withValid = rows.filter((r) => r.validCover).length;
+  return {
+    coverGen: COVER_GEN,
+    totalVideos: videos.length,
+    withThumb: withValid,          /* 「有可用封面」= 能解码且非匀色/非极小 */
+    withRecord,                    /* 元数据 hasThumb=true 的条数（可能是坏图） */
+    missing: videos.length - withValid,
+    rows,
   };
+}
+
+/**
+ * 把「有记录但匀色/极小/解不出」的封面作废，让本世代重新取帧。
+ * 返回作废条数。
+ */
+export async function invalidateBadThumbs(vault) {
+  const items = (vault && vault.items) || [];
+  let n = 0;
+  for (const it of items) {
+    if (it.kind !== "video" || it.trashedAt || !it.hasThumb) continue;
+    let insp;
+    try {
+      const bytes = await vault.readThumb(it.id);
+      insp = await inspectThumbBytes(bytes);
+      if (insp.previewUrl) try { URL.revokeObjectURL(insp.previewUrl); } catch { /* */ }
+    } catch {
+      insp = { ok: false };
+    }
+    if (insp && insp.ok) continue;
+    try {
+      if (typeof vault.deleteThumb === "function") await vault.deleteThumb(it.id);
+      else {
+        const DB = await import("./db.js");
+        await DB.del("thumbs", it.id);
+      }
+    } catch { /* */ }
+    it.hasThumb = false;
+    delete it.coverFail; delete it.coverFailAt; delete it.coverFailGen; delete it.coverFailMs;
+    try { await vault.saveItem(it); } catch { /* */ }
+    n++;
+  }
+  return n;
 }

@@ -102,8 +102,11 @@ export class MediaCache {
         }
         if (!bytes) return null;
         const item = this.vault.items.find((x) => x.id === id);
-        if (item && item.mime) type = item.mime;
-        else if (kind === "thumb") type = "image/jpeg";
+        /* 缩略图字节永远是 JPEG（cover.js / decodeImage 写入），绝不能用条目自身的
+           video/mp4、video/quicktime 等 MIME——WebKit 会拒绝把这种 Blob 当图片绘进
+           background-image，表现为「诊断说有封面、格子却是灰的」。 */
+        if (kind === "thumb") type = "image/jpeg";
+        else if (item && item.mime) type = item.mime;
         const url = URL.createObjectURL(new Blob([bytes], { type }));
         this.urls.set(key, url);
         this.#touch(kind, id);

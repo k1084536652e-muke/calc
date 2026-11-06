@@ -484,35 +484,62 @@ function renderPlusLayer(opts, overlay, bar){
   bindAlbum();
 }
 
-/* 设置 › 长按「版本」行约 0.65 秒：封面诊断（不改 mock 布局，仅对话框） */
+/* 设置 › 长按「版本」行约 0.65 秒：封面诊断（不改主 UI，仅对话框；含缩略图实图预览） */
 async function showCoverDiag(){
   try{
     const Cover=await import("./core/cover.js");
-    const d=Cover.diagnoseCovers(vault);
+    toast("分析封面中…");
+    const d=await Cover.diagnoseCovers(vault);
     const ctrl=navigator.serviceWorker&&navigator.serviceWorker.controller;
     const sw=ctrl?ctrl.scriptURL.replace(/^.*\//,""):"无";
-    const lines=[
+    const previews=[];
+    const layer=document.getElementById("layer");
+    const wrap=document.createElement("div");
+    wrap.className="dlg-back";
+    const head=[
       `应用 ${VER.cur} · 封面算法 gen ${d.coverGen}`,
       `SW ${sw}`,
-      `视频 ${d.withThumb}/${d.totalVideos} 有封面，缺 ${d.missing}`,
-      "",
-    ];
-    const miss=d.rows.filter(r=>!r.hasThumb).slice(0,12);
-    if(!miss.length) lines.push("全部视频都有封面。");
-    else{
-      for(const r of miss){
-        const sz=r.size?`${Math.round(r.size/1048576*10)/10}MB`:"?";
-        lines.push(`· ${r.name||r.id}`);
-        lines.push(`  ${sz} ${r.mime||"?"} fail=${r.coverFail||"—"} gen=${r.coverFailGen??"—"}`);
-      }
-      if(d.missing>miss.length) lines.push(`…另有 ${d.missing-miss.length} 条`);
-    }
-    dialog({
-      title:"封面诊断",
-      text:lines.join("\n"),
-      ok:"重试缺封面",
-      cancel:"关闭",
-      onOk:async()=>{
+      `可用封面 ${d.withThumb}/${d.totalVideos}（有记录 ${d.withRecord}，缺/坏 ${d.missing}）`,
+      `说明：若「有记录」但格子灰，看下方预览与 hypothesis。ok-should-show=字节正常应能显示（多为 Blob MIME 问题，2.1.6 已修）。uniform-blank/tiny=坏图会重取。`,
+    ].map(s=>`<div style="margin:0 0 4px">${esc(s)}</div>`).join("");
+    const cards=d.rows.slice(0,12).map(r=>{
+      const sz=r.size?`${Math.round(r.size/1048576*10)/10}MB`:"?";
+      const avg=`rgb(${r.avgR},${r.avgG},${r.avgB})`;
+      const img=r.previewUrl
+        ?`<img src="${r.previewUrl}" alt="" style="width:72px;height:72px;object-fit:cover;border-radius:8px;background:#333;flex:none;border:1px solid rgba(127,127,127,.35)">`
+        :`<div style="width:72px;height:72px;border-radius:8px;background:#333;flex:none;display:flex;align-items:center;justify-content:center;font-size:11px;color:#999">无图</div>`;
+      if(r.previewUrl) previews.push(r.previewUrl);
+      return `<div style="display:flex;gap:10px;align-items:flex-start;padding:8px 0;border-top:.5px solid var(--sep)">
+        ${img}
+        <div style="min-width:0;font-size:11px;line-height:1.45;word-break:break-all">
+          <b style="font-size:12px">${esc(r.name||r.id)}</b><br>
+          ${esc(sz)} · ${esc(r.mime||"?")}<br>
+          thumb ${r.thumbBytes}B · ${esc(r.thumbMime||"—")} · ${r.thumbW}×${r.thumbH}<br>
+          均色 <span style="display:inline-block;width:10px;height:10px;border-radius:2px;background:${avg};vertical-align:-1px;border:1px solid rgba(127,127,127,.4)"></span> ${avg} · 亮度${r.bright} · 方差${r.variance}${r.uniform?" · 匀色":""}${r.tiny?" · 极小":""}<br>
+          hasThumb=${r.hasThumb?"是":"否"} valid=${r.validCover?"是":"否"} fail=${esc(r.coverFail||"—")} gen=${r.coverFailGen??"—"}<br>
+          <b>hypothesis=${esc(r.hypothesis)}</b>
+        </div>
+      </div>`;
+    }).join("");
+    wrap.innerHTML=`<div class="dlg noinput" role="alertdialog" aria-modal="true" style="max-width:min(420px,92vw);max-height:82vh;overflow:auto">
+      <h4>封面诊断</h4>
+      <div style="text-align:left;font-size:12px;line-height:1.45;padding:0 4px 8px">${head}${cards||"<div>无视频</div>"}</div>
+      <div class="dbtns"><button type="button" data-x="c">关闭</button><button type="button" data-x="o">作废坏图并重试</button></div>
+    </div>`;
+    layer.appendChild(wrap);
+    requestAnimationFrame(()=>requestAnimationFrame(()=>wrap.classList.add("show")));
+    const revoke=()=>{ for(const u of previews){ try{ URL.revokeObjectURL(u); }catch(_){ } } previews.length=0; };
+    const close=()=>{ wrap.style.pointerEvents="none"; wrap.onclick=null; wrap.classList.remove("show"); setTimeout(()=>{ wrap.remove(); revoke(); },180); };
+    let downOnBack=false;
+    wrap.onpointerdown=e=>{ downOnBack=e.target===wrap; };
+    wrap.onclick=async(e)=>{
+      if(e.target===wrap){ if(downOnBack) close(); downOnBack=false; return; }
+      const b=e.target.closest("[data-x]");
+      if(!b) return;
+      if(b.dataset.x==="c"){ close(); return; }
+      b.disabled=true;
+      try{
+        const killed=await Cover.invalidateBadThumbs(vault);
         for(const it of vault.items){
           if(it.kind==="video"&&!it.hasThumb){
             delete it.coverFail; delete it.coverFailAt; delete it.coverFailGen; delete it.coverFailMs;
@@ -520,10 +547,18 @@ async function showCoverDiag(){
           }
         }
         try{ Cover._resetBackfillSession(); }catch(_){}
-        toast("开始重试封面…");
+        toast(killed?`已作废 ${killed} 张坏封面，开始重试…`:"开始重试封面…");
+        close();
         lazyBackfillCovers();
-      },
-    });
+        media.clear();
+        media.paintThumbs(document.getElementById("a-body"));
+        render({keepScroll:true});
+      }catch(err){
+        b.disabled=false;
+        toast("重试失败");
+        console.warn(err);
+      }
+    };
   }catch(err){ toast("诊断失败"); console.warn(err); }
 }
 function bindVerLongPress(root){
@@ -2539,12 +2574,25 @@ async function afterUnlock(){
    **不设一次性闸门**：每次解锁、以及用户打开某个缺封面视频时都会继续处理剩下的条目
    （每次仍限 6 个，避免一次跑完耗电/占用主线程）。 */
 let coverBackfillBusy=false;
+let coverBadSweepDone=false;
 async function lazyBackfillCovers(){
   if(coverBackfillBusy) return;
   coverBackfillBusy=true;
   let again=false;
   try{
     const Cover=await import("./core/cover.js");
+    /* 升到新 COVER_GEN 时：先扫一遍「有记录但匀色/极小」的坏封面并作废，再懒补 */
+    if(!coverBadSweepDone){
+      coverBadSweepDone=true;
+      try{
+        const killed=await Cover.invalidateBadThumbs(vault);
+        if(killed){
+          media.clear();
+          hydrate(); render._sig=null;
+          if(!document.querySelector("#layer .viewer")) render();
+        }
+      }catch(e){ console.warn("坏封面扫描跳过", e); }
+    }
     /* 一次只补 1 条：少读、不连播；coverFailGen>=COVER_GEN 的不再试 */
     const res=await Cover.backfillVideoCovers(vault,{limit:1, media});
     if(res&&res.fixed){

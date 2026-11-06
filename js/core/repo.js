@@ -356,6 +356,10 @@ export class Vault {
     await DB.put("thumbs", { id, ...env });
   }
 
+  async deleteThumb(id) {
+    try { await DB.del("thumbs", id); } catch { /* */ }
+  }
+
   // ---------- 文档 ----------
 
   async saveDoc(id, html) {

@@ -7,7 +7,7 @@
  * - version.json 永远走网络（更新检查需要拿到线上版本），不进缓存。
  */
 
-const VERSION = "2.1.5";
+const VERSION = "2.1.6";
 const CACHE = "daishui-shell-" + VERSION;
 
 /** 本 App（2.1.x）外壳缓存前缀 */
