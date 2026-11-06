@@ -209,20 +209,23 @@ export class Vault {
     await DB.putMany("items", rows);
   }
 
-  /** 移入回收站（软删除） */
+  /** 移入回收站（软删除）；同时重算文件夹封面（已删项不得再当封面） */
   async trashItems(ids) {
     const set = new Set(ids);
     const list = this.items.filter((it) => set.has(it.id));
     for (const it of list) it.trashedAt = now();
     await this.saveItems(list);
+    await this.refreshFolderCovers();
     return list.length;
   }
 
+  /** 从回收站恢复；封面按恢复后的存活条目重算 */
   async restoreItems(ids) {
     const set = new Set(ids);
     const list = this.items.filter((it) => set.has(it.id));
     for (const it of list) it.trashedAt = null;
     await this.saveItems(list);
+    await this.refreshFolderCovers();
     return list.length;
   }
 
@@ -271,13 +274,7 @@ export class Vault {
       await new Promise((r) => setTimeout(r, 0));
     }
     this.items = this.items.filter((it) => !idset.has(it.id));
-    let touched = false;
-    for (const f of this.folders) {
-      const before = (f.coverIds || []).length;
-      f.coverIds = (f.coverIds || []).filter((id) => !idset.has(id));
-      if (before !== f.coverIds.length) touched = true;
-    }
-    if (touched) await this.saveFolders(this.folders);
+    await this.refreshFolderCovers();
     return idset.size;
   }
 
@@ -454,10 +451,18 @@ export class Vault {
       it.folderIds = [...set];
     }
     if (touched.length) await this.saveItems(touched);
+    await this.refreshFolderCovers();
+    return touched.length;
+  }
 
-    // 封面候选：最近加入的图片排到第一张（§32）
+  /**
+   * 按当前未删除条目重算每个文件夹的 coverIds（最多 3 张，跳过文档与回收站）。
+   * 软删除 / 恢复 / 永久删除 / 加入移出文件夹后都要跑，避免封面仍指向已删项。
+   */
+  async refreshFolderCovers() {
     const covers = new Map();
     for (const it of this.items) {
+      if (it.trashedAt) continue;
       if (!it.folderIds || !it.folderIds.length) continue;
       if (it.kind === "doc") continue;
       for (const fid of it.folderIds) {
@@ -472,7 +477,7 @@ export class Vault {
       if (cur !== list.join(",")) { f.coverIds = list; changed.push(f); }
     }
     if (changed.length) await this.saveFolders(changed);
-    return touched.length;
+    return changed.length;
   }
 
   // ---------- 设置 ----------

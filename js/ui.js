@@ -111,7 +111,7 @@ function toUIItem(rec){
 function hydrate(){
   ITEMS = vault.items.map(toUIItem);
   FOLDERS = vault.folders.map(f=>({id:f.id,n:f.n,s:(f.coverIds||[]).slice(),c:0,ref:f}));
-  for(const f of FOLDERS) syncFolderCount(f.id);
+  refreshFolderCards();   /* 封面与计数一律以未删除条目为准（避免软删后仍显示旧封面） */
   refreshTrashDays();
   S.showNames = !!vault.settings.showNames;
   S.retention = String(vault.settings.retention||"30");
@@ -373,9 +373,10 @@ function tileHTML(it, selecting){
 function esc(s){return String(s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]))}
 
 function folderCover(f){
-  if(!f.s.length) return `<div class="fcover empty"><div>${ic("folder")}</div></div>`;
-  /* f.s = 封面候选（最近加入的图片 id，最多 3 个）；不足 3 张时按已有张数铺 */
-  return `<div class="fcover">${f.s.map((id,k)=>`<div class="fcth" data-thumb="${id}" style="background-image:${bgFor(ITEMS.find(it=>it.id===id))}"></div>`).join("")}</div>`;
+  /* 只用未删除、非文档的候选；回收站项绝不当封面 */
+  const ids=(f.s||[]).filter(id=>{ const it=ITEMS.find(x=>x.id===id); return it&&!it.trash&&!it.doc; }).slice(0,3);
+  if(!ids.length) return `<div class="fcover empty"><div>${ic("folder")}</div></div>`;
+  return `<div class="fcover">${ids.map(id=>`<div class="fcth" data-thumb="${id}" style="background-image:${bgFor(ITEMS.find(it=>it.id===id))}"></div>`).join("")}</div>`;
 }
 
 function render(opts){
@@ -942,6 +943,13 @@ function folderItems(){ return folderItemsFor(S.folder); }
 function syncFolderCount(fid){
   const f=FOLDERS.find(x=>x.id===fid); if(!f) return;
   f.c=ITEMS.filter(it=>!it.trash&&it.folderIds.has(fid)).length;
+}
+/** 按存活条目重算全部文件夹封面候选 + 计数（软删/恢复/移入移出后立刻刷新首页横条与文件夹页） */
+function refreshFolderCards(){
+  for(const f of FOLDERS){
+    f.s=ITEMS.filter(it=>!it.trash&&!it.doc&&it.folderIds.has(f.id)).slice(0,3).map(it=>it.id);
+    syncFolderCount(f.id);
+  }
 }
 /** 归属集合：直接读写条目的 folderIds（非互斥） */
 function memOf(id){ const it=ITEMS.find(x=>x.id===id); return it?it.folderIds:new Set(); }
@@ -1579,6 +1587,7 @@ function bindAlbum(){
       if(!item) return;
       vault.restoreItems([id]).catch(saveFail);
       item.trash=false; item.trashedAt=null; item.ref.trashedAt=null;
+      refreshFolderCards();
       refreshTrashDays(); toast("已恢复"); render();
       return;
     }
@@ -1716,7 +1725,7 @@ function bindAlbum(){
         const ids=[...S.sel];
         vault.setFolders(ids,[],[S.folder]).then(()=>{
           ids.forEach(id=>{ const it=ITEMS.find(x=>x.id===id); if(it) it.folderIds.delete(S.folder); });
-          syncFolderCount(S.folder); render();
+          refreshFolderCards(); render();
         }).catch(saveFail);
         S.sel=new Set(); render(); toast(`已移出 ${n} 项`);
       }});
@@ -1746,6 +1755,7 @@ function bindAlbum(){
       const ids=[...S.sel];
       vault.restoreItems(ids).catch(saveFail);
       ids.forEach(id=>{ const it=ITEMS.find(x=>x.id===id); if(it){ it.trash=false; it.trashedAt=null; it.ref.trashedAt=null; } });
+      refreshFolderCards();
       S.sel=new Set(); refreshTrashDays(); render(); toast("已恢复"); return;
     }
     if(act==="sel-purge"){
@@ -1820,6 +1830,7 @@ function deleteSelected(){
     const stamp=Date.now();
     list.forEach(it=>{ it.trash=true; it.trashedAt=stamp; it.ref.trashedAt=stamp; });
     vault.trashItems(list.map(it=>it.id)).catch(saveFail);
+    refreshFolderCards();
     refreshTrashDays();
   }
   S.sel=new Set();
@@ -1904,7 +1915,7 @@ function openFolderPicker(){
   layer.appendChild(wrap);
   const list=wrap.querySelector("#fp-list"), inp=wrap.querySelector("#fp-q"), clr=wrap.querySelector(".clr");
   const fhl=name=>{ const t=q.trim(); if(!t) return esc(name); const i=name.toLowerCase().indexOf(t.toLowerCase()); if(i<0) return esc(name); return esc(name.slice(0,i))+`<mark class="hl">${esc(name.slice(i,i+t.length))}</mark>`+esc(name.slice(i+t.length)); };
-  const thumb=f=>f.s.length?`<span class="fp-th" data-thumb="${f.s[0]}" style="background-image:${bgFor(ITEMS.find(it=>it.id===f.s[0]))}"></span>`:`<span class="fp-th empty">${ic("folder")}</span>`;
+  const thumb=f=>{ const id=(f.s||[]).find(i=>{ const it=ITEMS.find(x=>x.id===i); return it&&!it.trash&&!it.doc; }); return id?`<span class="fp-th" data-thumb="${id}" style="background-image:${bgFor(ITEMS.find(it=>it.id===id))}"></span>`:`<span class="fp-th empty">${ic("folder")}</span>`; };
   const draw=()=>{
     const t=q.trim().toLowerCase();
     const rows=FOLDERS.filter(f=>!t||f.n.toLowerCase().includes(t));
@@ -1952,9 +1963,9 @@ function openFolderPicker(){
       if(!addIds.length&&!removeIds.length){ return; }
       /* 内存先动，库随后写（失败有 Toast）；封面由仓储按「最近加入」重算 */
       ids.forEach(id=>{ const it=ITEMS.find(x=>x.id===id); if(!it) return; addIds.forEach(fid=>it.folderIds.add(fid)); removeIds.forEach(fid=>it.folderIds.delete(fid)); });
-      for(const f of FOLDERS) if(addIds.includes(f.id)||removeIds.includes(f.id)) syncFolderCount(f.id);
+      refreshFolderCards();
       vault.setFolders(ids,addIds,removeIds).then(()=>{
-        for(const id of addIds.concat(removeIds)){ const rec=vault.folders.find(x=>x.id===id); const ui=FOLDERS.find(x=>x.id===id); if(rec&&ui) ui.s=(rec.coverIds||[]).slice(); }
+        refreshFolderCards();
         render();
       }).catch(saveFail);
       S.select=false; S.sel=new Set(); render();
@@ -2047,6 +2058,7 @@ async function purgeWithUi(ids, { toastText="已删除" }={}){
   }
   list.forEach(id=>media.release("thumb",id));
   ITEMS=ITEMS.filter(x=>!list.includes(x.id));
+  refreshFolderCards();
   if(pg){
     pg.done({title:"已删除", text:toastText, hold:700});
     await new Promise(r=>setTimeout(r,720));
