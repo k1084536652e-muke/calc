@@ -77,6 +77,24 @@ export const idbBackend = {
   async putChunk(rec) { await DB.put("chunks", rec); },
   async getChunk(itemId, index) { return (await DB.get("chunks", [itemId, index])) || null; },
   async delChunks(itemId) { return DB.delRange("chunks", DB.keyRangeForItem(itemId)); },
+  /**
+   * 按批删除某条目的块：批间 await 0，给 UI 让出主线程。
+   * 测试用的内存后端可不实现，deleteChunkSet 会退回 delChunks。
+   */
+  async delChunksBatched(itemId, { batchSize = 40, onProgress } = {}) {
+    const keys = await DB.getRange("chunks", DB.keyRangeForItem(itemId), { keysOnly: true });
+    const total = keys.length;
+    let removed = 0;
+    const bs = Math.max(8, batchSize | 0);
+    for (let i = 0; i < keys.length; i += bs) {
+      const slice = keys.slice(i, i + bs);
+      await DB.delMany("chunks", slice);
+      removed += slice.length;
+      onProgress && onProgress({ removed, total, itemId });
+      await new Promise((r) => setTimeout(r, 0));
+    }
+    return removed;
+  },
   async countChunks(itemId) { return DB.countRange("chunks", DB.keyRangeForItem(itemId)); },
   /** 所有含 chunks 的 itemId（游标按 [itemId,index] 排序，逐组跳过，不加载值） */
   async chunkItemIds() {
@@ -467,25 +485,46 @@ export async function* chunkStream(itemId, { start = 0, end = Infinity, key, met
 // ---------------- 删除 ----------------
 
 /**
- * 彻底删除一组分块：先删 meta（立即不可读），再删所有块，最后校验计数为 0。
- * 校验失败会抛错（残留块由 cleanupOrphans 兜底）。
+ * 彻底删除一组分块：先删 meta（立即不可读），再按批删块并在批间让出主线程，
+ * 避免 1GB+ 视频上千块一次 cursor 删导致界面长时间无响应。
+ * @param {string} itemId
+ * @param {{ onProgress?: (p:{removed:number,total:number,itemId:string})=>void, batchSize?: number }} [opts]
  */
-export async function deleteChunkSet(itemId) {
+export async function deleteChunkSet(itemId, opts = {}) {
   const id = String(itemId);
+  const batchSize = Math.max(8, Number(opts.batchSize) || 40);
+  const onProgress = typeof opts.onProgress === "function" ? opts.onProgress : null;
   await backend.delMeta(id);
-  const removed = await backend.delChunks(id);
+  let removed = 0;
+  if (typeof backend.delChunksBatched === "function") {
+    removed = await backend.delChunksBatched(id, {
+      batchSize,
+      onProgress: onProgress ? (p) => onProgress({ ...p, itemId: id }) : null,
+    });
+  } else {
+    const total = await backend.countChunks(id);
+    removed = await backend.delChunks(id);
+    onProgress && onProgress({ removed, total: total || removed, itemId: id });
+  }
   const left = await backend.countChunks(id);
   if (left) throw new ChunkError(`删除后仍有 ${left} 块残留`, "LEFTOVER", { itemId: id, left });
   return { removed, left: 0 };
 }
 
 /** 批量删除（回收站彻底删除 / 清空内容 / 紧急清除） */
-export async function deleteChunkSets(ids) {
+export async function deleteChunkSets(ids, opts = {}) {
   let removed = 0;
   const failed = [];
-  for (const id of ids) {
+  const onProgress = typeof opts.onProgress === "function" ? opts.onProgress : null;
+  for (let i = 0; i < ids.length; i++) {
+    const id = ids[i];
     try {
-      const r = await deleteChunkSet(id);
+      const r = await deleteChunkSet(id, {
+        batchSize: opts.batchSize,
+        onProgress: onProgress
+          ? (p) => onProgress({ ...p, index: i + 1, itemTotal: ids.length })
+          : null,
+      });
       removed += r.removed;
     } catch (err) {
       failed.push({ id, error: err });

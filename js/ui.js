@@ -56,6 +56,8 @@ import { Vault, PIN_RE, DEFAULT_SETTINGS, quotaError } from "./core/repo.js";
 import { MediaCache } from "./core/media.js";
 import { DocEditor, toBrowseHTML } from "./ui/doc-editor.js";
 import { APP_VERSION } from "./version.js";
+/** 封面诊断入口：默认关闭。改为 true 后，设置 › 长按「版本」可打开诊断对话框（见 NOTES-220.md）。 */
+const COVER_DIAG_ENABLED = false;
 import { warmLegacyDetection, legacyMigrationState, migrateLegacy } from "./legacy-migrate.js";
 import { checkForUpdate, applyUpdate, registerSW } from "./core/updater.js";
 import * as Stream from "./core/stream.js";
@@ -114,6 +116,7 @@ function hydrate(){
   S.showNames = !!vault.settings.showNames;
   S.retention = String(vault.settings.retention||"30");
   S.slideInt = String(vault.settings.slideInt||"3");
+  S.autoLock = String(vault.settings.autoLock||"never");
   S.wipeOn = !!(vault.auth && vault.auth.wipe);
 }
 /** 回收站剩余天数（保留时间取设置；「永不」显示为大数） */
@@ -170,6 +173,7 @@ const S={picking:false,
   doc:null,
   retention:"30",
   slideInt:"3",   /* R10-09：幻灯片间隔（秒），设置页「幻灯片间隔」子页可选 2 / 3 / 5 / 8 */
+  autoLock:"never", /* 2.2.0：自动锁定；never / 60 / 120 / 300（秒） */
   wipeOn:false,   /* 紧急清除码是否已配置（来自仓储，不在本地明文里留痕） */
   limit:20,       /* §18 增量加载：当前已渲染批次数 × 20 */
   searchAnim:false, sort:"recent", pageEnd:"done", /* 文档页：{id,title,isNew,mode:"view"|"edit",sheet:bool} */ /* 设置子页：null / "pin" / "wipe" */
@@ -242,8 +246,81 @@ function privacyUncover(){
   document.getElementById("v-calc").hidden=true;
 }
 
+/* ===== 2.2.0 自动锁定（设置 › 安全 › 自动锁定）=====
+   无操作计时；播放视频 / 幻灯片进行中不计时，暂停或结束后重新起算。
+   切后台仍由 visibilitychange 立即锁定（与本计时无关）。 */
+let autoLockTimer=null;
+let autoLockLast=0;
+let _autoLockNow=()=>Date.now();
+function autoLockMs(){
+  const v=String(S.autoLock||"never");
+  if(v==="never"||v==="0"||v==="") return 0;
+  const n=Number(v);
+  return Number.isFinite(n)&&n>0 ? n*1000 : 0;
+}
+function isPlaybackActive(){
+  try{
+    const pager=window.__pager;
+    if(pager&&pager.slideshow&&!pager.paused) return true;
+  }catch(_){}
+  if(document.querySelector("#layer .viewer .plyr--playing")) return true;
+  const vid=document.querySelector("#layer .viewer video");
+  if(vid && !vid.paused && !vid.ended) return true;
+  return false;
+}
+function clearAutoLock(){
+  if(autoLockTimer){ clearTimeout(autoLockTimer); autoLockTimer=null; }
+}
+function bumpAutoLock(){
+  autoLockLast=_autoLockNow();
+  armAutoLock();
+}
+function armAutoLock(){
+  clearAutoLock();
+  if(S.view!=="album") return;
+  if(S.picking||importing||migrating) return;
+  const ms=autoLockMs();
+  if(!ms) return;
+  const left=Math.max(0, ms - (_autoLockNow()-autoLockLast));
+  autoLockTimer=setTimeout(tickAutoLock, Math.min(1000, Math.max(50, left)));
+}
+function tickAutoLock(){
+  autoLockTimer=null;
+  if(S.view!=="album") return;
+  const ms=autoLockMs();
+  if(!ms) return;
+  if(S.picking||importing||migrating){ bumpAutoLock(); return; }
+  /* 后台由 visibility 立即锁，这里不重复；回到前台后会 bump */
+  if(typeof document!=="undefined" && document.visibilityState==="hidden") return;
+  if(isPlaybackActive()){
+    /* 播放中不计时：把「最后活动」推到现在，等价于冻结倒计时 */
+    autoLockLast=_autoLockNow();
+    armAutoLock();
+    return;
+  }
+  if(_autoLockNow()-autoLockLast >= ms){
+    lock();
+    return;
+  }
+  armAutoLock();
+}
+/** 测试钩子（只读状态 + 可注入 now）；不含密钥 */
+export function getAutoLockDebug(){
+  return {
+    ms:()=>autoLockMs(),
+    last:()=>autoLockLast,
+    playback:()=>isPlaybackActive(),
+    bump:bumpAutoLock,
+    arm:armAutoLock,
+    tick:tickAutoLock,
+    setNow(fn){ _autoLockNow = typeof fn==="function" ? fn : ()=>Date.now(); },
+    resetNow(){ _autoLockNow=()=>Date.now(); },
+  };
+}
+
 /** 锁定回计算器：清空内存密钥与全部 objectURL（§2 / §23） */
 function lock(){
+  clearAutoLock();
   endPicker();
   privacyCovered=false;
   if(S.doc&&docEditor) saveDocBeforeLeave();
@@ -323,7 +400,7 @@ function render(opts){
 
   /* ---- 全局顶栏（含原地搜索面板） ---- */
   if(ctx==="settings"&&S.sub){
-    nav.innerHTML=`<div class="nav-row sub"><button type="button" class="back" data-act="back-sub" aria-label="返回">${ic("chevl")}</button><div class="nav-title"><b>${{pin:"解锁码",wipe:"紧急清除码",retention:"回收站保留时间",slideint:"幻灯片间隔"}[S.sub]}</b></div></div>`;
+    nav.innerHTML=`<div class="nav-row sub"><button type="button" class="back" data-act="back-sub" aria-label="返回">${ic("chevl")}</button><div class="nav-title"><b>${{pin:"解锁码",wipe:"紧急清除码",autolock:"自动锁定",retention:"回收站保留时间",slideint:"幻灯片间隔"}[S.sub]}</b></div></div>`;
   } else {
     const titles={photos:["首页", `${aliveItems().length} 项`], folders:["文件夹", `${FOLDERS.length} 个`], trash:["回收站", `${TRASH.length} 项`], settings:["设置", ""], folder:[f?f.n:"文件夹", `${folderItems().length} 项`]};
     const [title,count]=titles[ctx];
@@ -448,7 +525,7 @@ function renderPlusLayer(opts, overlay, bar){
     if(!overlay.dataset.plusBuilt){
       overlay.innerHTML=`<div class="scrim" data-act="close-plus"></div>
         <div class="pop">
-          <button type="button" data-act="add-photo">${ic("imgplus")}添加照片</button>
+          <button type="button" data-act="add-photo">${ic("imgplus")}上传图片/视频</button>
           <button type="button" data-act="add-doc">${ic("fileplus")}新建文档</button>
           <button type="button" data-act="add-folder">${ic("folderplus")}新建文件夹</button>
         </div>`;
@@ -479,7 +556,7 @@ function renderPlusLayer(opts, overlay, bar){
 
   /* 渲染完成：把已解密的缩略图贴上（不重建内容），并挂上增量加载哨兵 */
   media.paintThumbs(document.getElementById("a-body"));
-  bindVerLongPress(document.getElementById("a-body"));
+  if(COVER_DIAG_ENABLED) bindVerLongPress(document.getElementById("a-body"));
   attachSentinel();
   bindAlbum();
 }
@@ -662,6 +739,13 @@ function settingsBody(){
         <button type="button" class="cta" data-act="save-wipe">保存</button>
         <button type="button" class="dangerbtn" data-act="disable-wipe"${S.wipeOn?"":" disabled"}>关闭紧急清除</button>
       </div>`;
+  } else if(S.sub==="autolock"){
+    return `
+      <div class="page subpage">
+        <div class="gh">无操作后自动锁定</div>
+        <div class="group">${["never","60","120","300"].map(k=>`<button type="button" class="row" data-autolock="${k}"><span>${autoLockLabel(k)}</span>${S.autoLock===k?`<span class="ck">${ic("tick")}</span>`:""}</button>`).join("")}</div>
+        <p class="gf">播放视频或幻灯片时不计时；切到后台仍会立即锁定（与「自动锁定」无关）</p>
+      </div>`;
   } else {
     return `
       <div class="page">
@@ -685,6 +769,7 @@ function settingsBody(){
         <div class="group">
           <button type="button" class="row" data-act="open-pin"><span>解锁码</span><span class="v">修改${ic("chev")}</span></button>
           <button type="button" class="row" data-act="open-wipe"><span>紧急清除码</span><span class="v">${S.wipeOn?"已配置":"未配置"}${ic("chev")}</span></button>
+          <button type="button" class="row" data-act="open-autolock"><span>自动锁定</span><span class="v">${autoLockLabel(S.autoLock)}${ic("chev")}</span></button>
         </div>
         <div class="gh">关于</div>
         <div class="group">
@@ -804,6 +889,7 @@ function bindDragSelect(){
 function resetModes(){ S.search=false; S.searchAnim=false; S.q=""; S.filter="all"; S.select=false; S.sel=new Set(); }
 function toggleSel(id){ const on=!S.sel.has(id); if(on) S.sel.add(id); else S.sel.delete(id); markSel(id,on); renderSelbar(); }
 function retLabel(k){ return k==="never"?"永不自动删除":k+" 天"; }
+function autoLockLabel(k){ return k==="never"?"永不":k+" 秒"; }
 /* FLIP：只用 transform / opacity；只动画视口内及附近的元素 */
 const FLIP_SEL="[data-flip],[data-id],[data-folder],[data-tid]";
 const flipKey=el=>el.dataset.flip||el.dataset.id||el.dataset.folder||el.dataset.tid;
@@ -883,7 +969,7 @@ function pageEndHTML(ctx, more){
 /* A-06 两种空状态 */
 function emptyTrue(kind){
   const map={
-    photos:`<div class="empty-state soft">${ic("imgplus")}<p>还没有文件</p><small style="color:var(--faint);font-size:13px">点底部 ＋ 添加照片或新建文档</small></div>`,
+    photos:`<div class="empty-state soft">${ic("imgplus")}<p>还没有文件</p><small style="color:var(--faint);font-size:13px">点底部 ＋ 上传图片/视频或新建文档</small></div>`,
     folder:`<div class="empty-state soft">${ic("folder")}<p>文件夹是空的</p><small style="color:var(--faint);font-size:13px">从首页把文件加入此文件夹</small></div>`,
     folders:`<div class="empty-state soft">${ic("folderplus")}<p>还没有文件夹</p></div>`,
     trash:`<div class="empty-state">${ic("trash")}<p>回收站为空</p></div>`,
@@ -1152,7 +1238,7 @@ function toggleSearch(){
   setTimeout(()=>{ if(!S.search&&S.view==="album"&&!S.doc) render({keepBody:true}); },400);
 }
 
-/* 「＋ › 添加照片」打开系统选取器（§24）：选取器打开期间 + 保持按下（×）状态，
+/* 「＋ › 上传图片/视频」打开系统选取器（§24）：选取器打开期间 + 保持按下（×）状态，
    直到 change / cancel、window focus / visibilitychange 回来或用户点任意处才复原。 */
 const PICK={openedAt:0,endedAt:0,input:null,off:null};
 let reopenPlus=false;
@@ -1462,6 +1548,13 @@ function bindAlbum(){
       refreshTrashDays();
       render(); return;
     }
+    const al=e.target.closest("[data-autolock]");
+    if(al){
+      S.autoLock=al.dataset.autolock;
+      vault.saveSettings({autoLock:S.autoLock}).catch(saveFail);
+      armAutoLock();
+      render(); return;
+    }
     /* R10-09：「幻灯片间隔」子页选项，写法同「回收站保留时间」 */
     const si=e.target.closest("[data-slideint]");
     if(si){
@@ -1492,10 +1585,8 @@ function bindAlbum(){
     if(t.dataset.purge){
       const id=t.dataset.purge;
       dialog({title:"永久删除？", text:"删除后无法恢复", ok:"删除", danger:true, onOk:async ()=>{
-        await vault.purgeItems([id]);
-        media.release("thumb",id);
-        ITEMS=ITEMS.filter(x=>x.id!==id); refreshTrashDays();
-        render(); toast("已删除");
+        await purgeWithUi([id], {toastText:"已删除"});
+        refreshTrashDays(); render();
       }});
       return;
     }
@@ -1559,15 +1650,14 @@ function bindAlbum(){
     if(act==="toggle-page-end"){ S.pageEnd=S.pageEnd==="loading"?"done":"loading"; refreshBody(); return; }
     if(act==="sel-toggle-all"){ const ids=selectableIds(); S.sel=(ids.length&&S.sel.size>=ids.length)?new Set():new Set(ids); applySelect(); return; }
     if(act==="open-retention"){ S.sub="retention"; render(); return; }
+    if(act==="open-autolock"){ S.sub="autolock"; render(); return; }
     if(act==="open-slideint"){ S.sub="slideint"; render(); return; }   /* R10-09：设置「显示」分组 → 幻灯片间隔子页 */
     if(act==="empty-trash"){
       const n=TRASH.length; if(!n) return;
       dialog({title:"清空回收站？", text:`将永久删除全部 ${n} 个文件，无法恢复`, ok:"清空", danger:true, onOk:async ()=>{
         const ids=ITEMS.filter(it=>it.trash).map(it=>it.id);
-        await vault.purgeItems(ids);
-        ids.forEach(id=>media.release("thumb",id));
-        ITEMS=ITEMS.filter(it=>!it.trash);
-        S.select=false; S.sel=new Set(); refreshTrashDays(); render(); toast("已清空");
+        await purgeWithUi(ids, {toastText:"已清空"});
+        S.select=false; S.sel=new Set(); refreshTrashDays(); render();
       }});
       return;
     }
@@ -1661,10 +1751,8 @@ function bindAlbum(){
     if(act==="sel-purge"){
       const n=S.sel.size, ids=[...S.sel];
       dialog({title:`永久删除 ${n} 项？`, text:"删除后无法恢复", ok:"删除", danger:true, onOk:async ()=>{
-        await vault.purgeItems(ids);
-        ids.forEach(id=>media.release("thumb",id));
-        ITEMS=ITEMS.filter(x=>!ids.includes(x.id)); refreshTrashDays();
-        S.sel=new Set(); render(); toast("已删除");
+        await purgeWithUi(ids, {toastText:"已删除"});
+        refreshTrashDays(); S.sel=new Set(); render();
       }});
       return;
     }
@@ -1884,13 +1972,16 @@ function progressDialog(opts){
   const layer=document.getElementById("layer");
   const wrap=document.createElement("div");
   wrap.className="dlg-back pg-back";
+  const btns=opts.noCancel
+    ?`<div class="dbtns one" hidden></div>`
+    :`<div class="dbtns one"><button type="button" data-x="c">${esc(opts.cancel||"取消")}</button></div>`;
   wrap.innerHTML=`<div class="dlg pgd" role="dialog" aria-modal="true" aria-labelledby="pg-t">
     <div class="pg-ic" aria-hidden="true"><i class="spin"></i>${ic("tick")}</div>
     <h4 id="pg-t">${esc(opts.title||"正在处理…")}</h4>
     <p class="pg-file" aria-live="polite">&nbsp;</p>
     <div class="pg-bar" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><i></i></div>
     <div class="pg-meta"><span class="pg-n"></span><span class="pg-pct">0%</span></div>
-    <div class="dbtns one"><button type="button" data-x="c">${esc(opts.cancel||"取消")}</button></div></div>`;
+    ${btns}</div>`;
   layer.appendChild(wrap);
   requestAnimationFrame(()=>requestAnimationFrame(()=>wrap.classList.add("show")));
   const $=sel=>wrap.querySelector(sel);
@@ -1916,8 +2007,53 @@ function progressDialog(opts){
     fail(text){ if(closed) return; wrap.querySelector(".pgd").classList.add("is-fail"); $("#pg-t").textContent="未完成"; $(".pg-file").textContent=text||""; setTimeout(api.close,1400); },
     close(){ if(closed) return; closed=true; wrap.classList.remove("show"); setTimeout(()=>wrap.remove(),240); }
   };
-  wrap.onclick=e=>{ const b=e.target.closest("[data-x]"); if(b&&!closed){ opts.onCancel&&opts.onCancel(); api.close(); } };
+  wrap.onclick=e=>{
+    if(opts.noCancel) return;
+    const b=e.target.closest("[data-x]");
+    if(b&&!closed){ opts.onCancel&&opts.onCancel(); api.close(); }
+  };
   return api;
+}
+
+/**
+ * 永久删除（含分块大文件）带进度反馈：超过 ~300ms 才弹出进度窗，避免闪一下。
+ * 完成后才改列表 / 导航；不可取消（半删会留下孤儿，启动时再清）。
+ */
+async function purgeWithUi(ids, { toastText="已删除" }={}){
+  const list=[...new Set(ids||[])];
+  if(!list.length) return 0;
+  const t0=Date.now();
+  let pg=null;
+  const showTimer=setTimeout(()=>{
+    pg=progressDialog({title:"正在删除…", total:list.length, noCancel:true});
+  }, 300);
+  try{
+    await vault.purgeItems(list, {
+      onProgress:(p)=>{
+        if(!pg && Date.now()-t0>=300){
+          clearTimeout(showTimer);
+          pg=progressDialog({title:"正在删除…", total:list.length, noCancel:true});
+        }
+        if(!pg) return;
+        const it=ITEMS.find(x=>x.id===p.id);
+        const name=it&&it.name || "文件";
+        const extra=(p.chunkTotal&&p.chunkTotal>0)
+          ?` · 块 ${p.chunkRemoved||0}/${p.chunkTotal}` : "";
+        pg.set({index:p.index, name:name+extra, pct:p.pct});
+      },
+    });
+  }finally{
+    clearTimeout(showTimer);
+  }
+  list.forEach(id=>media.release("thumb",id));
+  ITEMS=ITEMS.filter(x=>!list.includes(x.id));
+  if(pg){
+    pg.done({title:"已删除", text:toastText, hold:700});
+    await new Promise(r=>setTimeout(r,720));
+  }else{
+    toast(toastText);
+  }
+  return list.length;
 }
 /* ===== 真实导出（§44 进度弹窗）：逐项解密 → 下载 =====
    iOS 对连续多文件下载支持有限，必要时用户可分次导出；导出不改动本地数据。 */
@@ -2074,6 +2210,9 @@ function mountPlyr(host, video, stage, onAdjacent){
   }
   player.on("controlshidden",()=>host.classList.add("chrome-hidden"));
   player.on("controlsshown",()=>host.classList.remove("chrome-hidden"));
+  /* 2.2.0：播放中自动锁定不计时；暂停/结束重新起算 */
+  video.addEventListener("pause",()=>bumpAutoLock());
+  video.addEventListener("ended",()=>bumpAutoLock());
   /* 双击 / 双指点左右三分之一：−10 / +10 秒（中间保留 Plyr 的双击全屏） */
   let last=0, lastSide="";
   const sideOf=x=>{ const r=stage.getBoundingClientRect(), f=(x-r.left)/r.width; return f<1/3?"l":f>2/3?"r":""; };
@@ -2425,6 +2564,7 @@ function openViewer(id, opts){
     if(b.dataset.x==="pause"){   /* R10-05：暂停 / 继续——照片停表、视频暂停；继续时当前项重新计时 / 续播 */
       ssPaused=!ssPaused; ssIcon();
       if(ssPaused) ssStop(); else ssArm();
+      bumpAutoLock();
       return;
     }
     if(b.dataset.x==="ren"){   /* 重命名作用于「当前」项，文件名随翻页更新 */
@@ -2564,6 +2704,7 @@ async function afterUnlock(){
     if(purged) console.info("已清理到期回收站项目", purged);
   }catch(err){ console.warn("回收站清理失败", err); }
   openAlbum();
+  bumpAutoLock();
   /* 懒补：每种封面算法世代每条只试一次（见 coverFailGen）；升级 COVER_GEN 后会自动再试一轮 */
   lazyBackfillCovers();
   checkUpdate(false);
@@ -2724,8 +2865,14 @@ export async function initUI({ vault: v, media: m }){
   /* 进入后台立即锁定并清空密钥与 objectURL（§2）。系统文件选取器 / 导入过程中不打断。
      2.1.2：任何「要离开前台」的信号都先同步盖上计算器遮罩（见 privacyCover），再决定锁不锁。 */
   document.addEventListener("visibilitychange",()=>{
-    if(document.visibilityState!=="hidden"){ privacyUncover(); checkUpdate(false); return; }
+    if(document.visibilityState!=="hidden"){
+      privacyUncover();
+      checkUpdate(false);
+      if(S.view==="album") bumpAutoLock();
+      return;
+    }
     privacyCover();
+    clearAutoLock();
     if(S.view!=="album"||S.picking||importing||migrating) return;
     lock();
   });
@@ -2738,5 +2885,14 @@ export async function initUI({ vault: v, media: m }){
   /* blur / focus：只遮不锁 —— 系统文件选择器、输入弹窗、控制中心这类临时失焦不该把相册锁掉；
      回到前台时如果没锁就原样还原。dialog 是页内弹层，不会触发 window blur，互不影响。 */
   window.addEventListener("blur",()=>{ privacyCover(); });
-  window.addEventListener("focus",()=>{ privacyUncover(); });
+  window.addEventListener("focus",()=>{ privacyUncover(); if(S.view==="album") bumpAutoLock(); });
+  /* 自动锁定：任意指针/触摸/键盘/滚动/输入都重置计时 */
+  const alBump=(e)=>{
+    if(S.view!=="album") return;
+    /* 进度/确认弹层上的操作也算活动 */
+    bumpAutoLock();
+  };
+  ["pointerdown","touchstart","keydown","wheel","scroll","input"].forEach(n=>{
+    document.addEventListener(n, alBump, {capture:true, passive:true});
+  });
 }

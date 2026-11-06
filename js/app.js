@@ -2,7 +2,7 @@
 import { Vault } from "./core/repo.js";
 import { MediaCache } from "./core/media.js";
 import * as Stream from "./core/stream.js";
-import { initUI } from "./ui.js";
+import { initUI, getAutoLockDebug } from "./ui.js";
 
 const vault = new Vault();
 const media = new MediaCache(vault);
@@ -21,5 +21,6 @@ Object.defineProperty(window, "__app", {
   value: {
     get unlocked() { return vault.unlocked; },
     get version() { return document.querySelector('meta[name="build"]')?.content || ""; },
+    get autoLock() { return getAutoLockDebug(); },
   },
 });

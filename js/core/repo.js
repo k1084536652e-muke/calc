@@ -20,6 +20,7 @@ export const DEFAULT_SETTINGS = {
   showNames: false,
   retention: "30",     // "7" | "30" | "90" | "never"
   slideInt: "3",       // "2" | "3" | "5" | "8"
+  autoLock: "never",   // "never" | "60" | "120" | "300"（秒）；永不 = 不自动锁
 };
 
 /**
@@ -225,24 +226,51 @@ export class Vault {
     return list.length;
   }
 
-  /** 永久删除：条目 + 原件 + 缩略图 + 文档正文，一次事务清干净 */
-  async purgeItems(ids) {
+  /**
+   * 永久删除：条目 + 原件 + 缩略图 + 文档正文，再清分块。
+   * @param {string[]} ids
+   * @param {{ onProgress?: (p:{index:number,total:number,id:string,pct:number,chunkRemoved?:number,chunkTotal?:number})=>void }} [opts]
+   */
+  async purgeItems(ids, opts = {}) {
     const idset = new Set(ids);
     if (!idset.size) return 0;
+    const onProgress = typeof opts.onProgress === "function" ? opts.onProgress : null;
+    const list = [...idset];
     const ops = [];
-    for (const id of idset) {
+    for (const id of list) {
       ops.push({ type: "del", store: "items", key: id });
       ops.push({ type: "del", store: "blobs", key: id });
       ops.push({ type: "del", store: "thumbs", key: id });
       ops.push({ type: "del", store: "docs", key: id });
     }
     await DB.writeBatch(ops);
-    // 分块大文件：条目先删（避免悬空引用），再清分块（meta 先删 → 立即不可读 → 块逐个删干净）
-    try {
-      await Chunks.deleteChunkSets([...idset]);
-    } catch { /* 残留块由启动时的 cleanupOrphans 兜底，不影响条目已删除 */ }
+    // 分块大文件：条目先删（避免悬空引用），再按批清分块；批间让出主线程
+    for (let i = 0; i < list.length; i++) {
+      const id = list[i];
+      try {
+        await Chunks.deleteChunkSet(id, {
+          onProgress: onProgress
+            ? (p) => {
+              const frac = p.total ? p.removed / p.total : 1;
+              onProgress({
+                index: i + 1,
+                total: list.length,
+                id,
+                chunkRemoved: p.removed,
+                chunkTotal: p.total,
+                pct: ((i + frac) / list.length) * 100,
+              });
+            }
+            : null,
+        });
+      } catch { /* 残留块由启动时的 cleanupOrphans 兜底 */ }
+      onProgress && onProgress({
+        index: i + 1, total: list.length, id,
+        pct: ((i + 1) / list.length) * 100,
+      });
+      await new Promise((r) => setTimeout(r, 0));
+    }
     this.items = this.items.filter((it) => !idset.has(it.id));
-    // 文件夹封面候选同步剔除
     let touched = false;
     for (const f of this.folders) {
       const before = (f.coverIds || []).length;
