@@ -98,6 +98,7 @@ function toUIItem(rec){
     video:rec.kind==="video",
     kind:rec.kind,
     dur:fmtDur(rec.dur),
+    hasThumb:!!rec.hasThumb,
     trash:!!rec.trashedAt,
     trashedAt:rec.trashedAt||null,
     folderIds:new Set(rec.folderIds||[]),
@@ -478,10 +479,70 @@ function renderPlusLayer(opts, overlay, bar){
 
   /* 渲染完成：把已解密的缩略图贴上（不重建内容），并挂上增量加载哨兵 */
   media.paintThumbs(document.getElementById("a-body"));
+  bindVerLongPress(document.getElementById("a-body"));
   attachSentinel();
   bindAlbum();
 }
 
+/* 设置 › 长按「版本」行约 0.65 秒：封面诊断（不改 mock 布局，仅对话框） */
+async function showCoverDiag(){
+  try{
+    const Cover=await import("./core/cover.js");
+    const d=Cover.diagnoseCovers(vault);
+    const ctrl=navigator.serviceWorker&&navigator.serviceWorker.controller;
+    const sw=ctrl?ctrl.scriptURL.replace(/^.*\//,""):"无";
+    const lines=[
+      `应用 ${VER.cur} · 封面算法 gen ${d.coverGen}`,
+      `SW ${sw}`,
+      `视频 ${d.withThumb}/${d.totalVideos} 有封面，缺 ${d.missing}`,
+      "",
+    ];
+    const miss=d.rows.filter(r=>!r.hasThumb).slice(0,12);
+    if(!miss.length) lines.push("全部视频都有封面。");
+    else{
+      for(const r of miss){
+        const sz=r.size?`${Math.round(r.size/1048576*10)/10}MB`:"?";
+        lines.push(`· ${r.name||r.id}`);
+        lines.push(`  ${sz} ${r.mime||"?"} fail=${r.coverFail||"—"} gen=${r.coverFailGen??"—"}`);
+      }
+      if(d.missing>miss.length) lines.push(`…另有 ${d.missing-miss.length} 条`);
+    }
+    dialog({
+      title:"封面诊断",
+      text:lines.join("\n"),
+      ok:"重试缺封面",
+      cancel:"关闭",
+      onOk:async()=>{
+        for(const it of vault.items){
+          if(it.kind==="video"&&!it.hasThumb){
+            delete it.coverFail; delete it.coverFailAt; delete it.coverFailGen; delete it.coverFailMs;
+            try{ await vault.saveItem(it); }catch(_){}
+          }
+        }
+        try{ Cover._resetBackfillSession(); }catch(_){}
+        toast("开始重试封面…");
+        lazyBackfillCovers();
+      },
+    });
+  }catch(err){ toast("诊断失败"); console.warn(err); }
+}
+function bindVerLongPress(root){
+  const row=root.querySelector(".verrow");
+  if(!row||row.dataset.lpBound) return;
+  row.dataset.lpBound="1";
+  let timer=null, fired=false;
+  const clear=()=>{ if(timer){ clearTimeout(timer); timer=null; } };
+  row.addEventListener("pointerdown",(e)=>{
+    if(e.button!=null&&e.button!==0) return;
+    fired=false;
+    clear();
+    timer=setTimeout(()=>{ timer=null; fired=true; showCoverDiag(); }, 650);
+  });
+  ["pointerup","pointercancel","pointerleave"].forEach(n=>row.addEventListener(n,clear));
+  row.addEventListener("click",(e)=>{
+    if(fired){ e.preventDefault(); e.stopPropagation(); fired=false; }
+  },true);
+}
 /* 设置 ›「版本」行（§29 / §50）：四种状态；App 永不自动切换版本，只在用户确认后更新 */
 const VER={st:0,cur:APP_VERSION,next:"",timer:0};
 async function checkUpdate(manual){
@@ -1668,7 +1729,7 @@ function dialog(opts){
   const itype=inp&&inp.type?inp.type:"text";
   const iattrs=inp?` type="${esc(itype)}" value="${esc(inp.value||"")}" placeholder="${esc(inp.placeholder||"")}" autocomplete="${esc(inp.autocomplete||"off")}"${inp.inputmode?` inputmode="${esc(inp.inputmode)}"`:""}${inp.pattern?` pattern="${esc(inp.pattern)}"`:""}${inp.maxlength?` maxlength="${esc(String(inp.maxlength))}"`:""}`:"";
   wrap.innerHTML=`<div class="dlg${inp?"":" noinput"}" role="alertdialog" aria-modal="true"><h4>${esc(opts.title)}</h4>
-    ${opts.text?`<p>${esc(opts.text)}</p>`:""}
+    ${opts.text?`<p${/\n/.test(opts.text)?` style="white-space:pre-wrap;text-align:left;font-size:12px;line-height:1.45"`:""}>${esc(opts.text)}</p>`:""}
     ${inp?`<div class="din"><input id="dlg-in"${iattrs}>${inp.suffix?`<span>${esc(inp.suffix)}</span>`:""}</div>
     <div class="derr" id="dlg-err"></div>`:""}
     <div class="dbtns"><button type="button" data-x="c">${esc(opts.cancel||"取消")}</button><button type="button" data-x="o" class="${opts.danger?"danger":""}">${esc(opts.ok||"确定")}</button></div></div>`;
@@ -2468,8 +2529,8 @@ async function afterUnlock(){
     if(purged) console.info("已清理到期回收站项目", purged);
   }catch(err){ console.warn("回收站清理失败", err); }
   openAlbum();
-  /* 每次解锁清一次本会话失败记忆：上一版 WebKit 取帧失败的条目会再试；coverFail 元数据仅诊断用，不拦重试 */
-  import("./core/cover.js").then((C)=>{ try{ C._resetBackfillSession(); }catch(_){} lazyBackfillCovers(); }).catch(()=>lazyBackfillCovers());
+  /* 懒补：每种封面算法世代每条只试一次（见 coverFailGen）；升级 COVER_GEN 后会自动再试一轮 */
+  lazyBackfillCovers();
   checkUpdate(false);
 }
 /* 2.1.2：已导入但没有封面的视频，懒补首帧 → 加密写入 thumbs。
@@ -2484,17 +2545,16 @@ async function lazyBackfillCovers(){
   let again=false;
   try{
     const Cover=await import("./core/cover.js");
-    const res=await Cover.backfillVideoCovers(vault,{limit:6, media});
+    /* 一次只补 1 条：少读、不连播；coverFailGen>=COVER_GEN 的不再试 */
+    const res=await Cover.backfillVideoCovers(vault,{limit:1, media});
     if(res&&res.fixed){
       hydrate(); render._sig=null;
-      /* 查看器打开时不要重渲染底下的网格（会打断正在看的条目）；数据已 hydrate，下次渲染自然带封面 */
       if(!document.querySelector("#layer .viewer")) render();
     }
-    /* 还有剩且不是「SW 暂不可用」：稍后继续下一批 */
     again=!!(res&&res.remaining>0&&!res.unavailable&&document.visibilityState!=="hidden");
   }catch(err){ console.warn("封面懒补跳过", err); }
   finally{ coverBackfillBusy=false; }
-  if(again) setTimeout(()=>{ lazyBackfillCovers(); }, 800);
+  if(again) setTimeout(()=>{ lazyBackfillCovers(); }, 600);
 }
 /** 紧急清除码：立即清空本机全部内容（含解锁码），回到首次使用状态 */
 async function emergencyWipe(){

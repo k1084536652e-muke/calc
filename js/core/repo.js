@@ -554,6 +554,15 @@ export class Vault {
     let attempted = 0;
     let quotaHit = null;
 
+    /* iOS：文件选择的用户手势只在本轮同步栈里有效。
+       先给所有视频同步 beginCapture（挂 blob URL + play），再逐个 await 结果 + 加密写入。 */
+    const videoPrimes = new Map();
+    const videoPrimed = new Set();
+    for (const file of files) {
+      const mime0 = sniffMime(file);
+      if (/^video\//.test(mime0)) videoPrimes.set(file, Cover.beginCapture(file, { mime: mime0 }));
+    }
+
     for (let i = 0; i < total; i++) {
       if (cancelled && cancelled()) break;
       if (!this.dekKey) break;           // 已锁定：不再处理后续文件（每一个都会因无 key 抛错）
@@ -567,7 +576,7 @@ export class Vault {
 
       try {
         // 1) 元数据 + 缩略图：直接从 File 解码（图片用 createImageBitmap / <img>，
-        //    视频用 cover.js 从 File 的 objectURL 取首帧），**不做 file.arrayBuffer()**
+        //    视频用导入时 beginCapture 的句柄），**不做 file.arrayBuffer()**
         const item = {
           id,
           kind,
@@ -586,12 +595,15 @@ export class Vault {
           const meta = await decodeImage(file);
           item.w = meta.w; item.h = meta.h; thumb = meta.thumb;
         } else if (kind === "video") {
-          const meta = await Cover.captureCover(file, { mime });
+          const handle = videoPrimes.get(file);
+          if (handle) videoPrimed.add(file);
+          const meta = handle ? await handle.promise : await Cover.captureCover(file, { mime });
           item.w = meta.w; item.h = meta.h; item.dur = meta.dur; thumb = meta.thumb;
           if (!thumb && meta.reason) {
             item.coverFail = meta.reason;
             item.coverFailAt = now();
             item.coverFailGen = Cover.COVER_GEN;
+            item.coverFailMs = meta.ms || null;
           }
         }
 
@@ -634,6 +646,10 @@ export class Vault {
       for (let k = attempted; k < total; k++) {
         failed.push({ name: (files[k] && files[k].name) || "未命名", error: reason, code: "QUOTA", skipped: true });
       }
+    }
+    // 取消尚未轮到的取帧（已 await 的会自己收尾）
+    for (const [f, h] of videoPrimes) {
+      if (!videoPrimed.has(f)) { try { h.cancel(); } catch { /* */ } }
     }
     return { imported, failed };
   }

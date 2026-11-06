@@ -1,32 +1,41 @@
 /**
- * 视频首帧封面（2.1.4）。
+ * 视频封面（2.1.5）
  *
- * iOS / WebKit 实测（Playwright WebKit + 真机反馈）：
- *  - 元数据（duration / videoWidth）可以在未出画时就拿到 → 角标有时长、格子却是灰的；
- *  - 1×1 / opacity:0 / 未入 DOM 的 <video>，即使 seeked + play(60ms)，drawImage 仍是全黑；
- *  - 必须：入 DOM、给真实像素尺寸、muted+playsinline、先 play() 强制解码，
- *    再用 requestVideoFrameCallback（或足够长的 playing/canplay 等待）等到真正出帧后再 drawImage。
- *  - 本模块**只吃 File/Blob 或已授权的同源 URL**，绝不整份 arrayBuffer；失败只影响封面。
+ * 设计（与用户确认一致）：
+ *  1. **导入时**从原始 File 的 blob: URL 取一帧小 JPEG（与照片缩略图同级），加密进 thumbs；
+ *     绝不为封面去「整段播放」大视频。
+ *  2. **懒补**只服务旧条目：一次一个、每种算法世代只试一次（coverFailGen），
+ *     优先小文件整份 / 流式 URL seek 到 ~0.1s（Range 只拉开头几块），成功或失败都落盘标记。
+ *
+ * iOS / WebKit 要点（真机 + Playwright 证据）：
+ *  - 时长/宽高可以在未出画时就有 → 角标有、格子灰；
+ *  - 取帧必须：入 DOM、真实像素尺寸、muted+playsinline；
+ *  - 文件选择回调里尽快 video.play()，否则丢掉用户手势后自动播放被拒 → 黑帧；
+ *  - requestVideoFrameCallback 等到真正出帧再 drawImage。
  */
 
+export const COVER_GEN = 5;
 const DEFAULT_TIMEOUT = 12000;
-/** 生成算法世代：升级后清掉本会话「失败不再试」的记忆，让旧失败条目自动重试 */
-export const COVER_GEN = 4;
+/** 懒补时允许整份解密取帧的上限（legacy 或退回路径） */
+export const LEGACY_INLINE_MAX = 12 * 1024 * 1024;
+/** 流式取帧：seek 到此秒，SW Range 只需开头几块 */
+const FRAME_AT = 0.1;
 
 function withTimeout(promise, ms, fallback) {
   return new Promise((resolve) => {
     let done = false;
     const t = setTimeout(() => { if (!done) { done = true; resolve(fallback); } }, ms);
-    promise.then((v) => { if (!done) { done = true; clearTimeout(t); resolve(v); } },
-      () => { if (!done) { done = true; clearTimeout(t); resolve(fallback); } });
+    promise.then(
+      (v) => { if (!done) { done = true; clearTimeout(t); resolve(v); } },
+      () => { if (!done) { done = true; clearTimeout(t); resolve(fallback); } },
+    );
   });
 }
 
-/** 首帧取帧位置：0.1s，但不超过时长的 1/10，避免极短视频越界 */
 export function frameTime(dur) {
   const d = Number.isFinite(dur) && dur > 0 ? dur : 0;
-  if (!d) return 0.1;
-  return Math.min(0.1, Math.max(0, d * 0.1));
+  if (!d) return FRAME_AT;
+  return Math.min(FRAME_AT, Math.max(0, d * 0.1));
 }
 
 function waitEvent(el, names, ms) {
@@ -36,15 +45,11 @@ function waitEvent(el, names, ms) {
   }), ms, false);
 }
 
-/** 等到视频真正产出一帧（WebKit 关键路径） */
 function waitForFrame(video, ms) {
   if (typeof video.requestVideoFrameCallback === "function") {
     return withTimeout(new Promise((resolve) => {
-      try {
-        video.requestVideoFrameCallback(() => resolve(true));
-      } catch {
-        resolve(false);
-      }
+      try { video.requestVideoFrameCallback(() => resolve(true)); }
+      catch { resolve(false); }
     }), ms, false);
   }
   return waitEvent(video, ["loadeddata", "canplay", "playing", "timeupdate"], ms);
@@ -58,16 +63,16 @@ function drawToJpeg(source, w, h) {
   const canvas = document.createElement("canvas");
   canvas.width = tw; canvas.height = th;
   const ctx = canvas.getContext("2d", { willReadFrequently: true });
-  try { ctx.drawImage(source, 0, 0, tw, th); } catch { return Promise.resolve({ thumb: null, bright: 0 }); }
-  let bright = 0;
-  let variance = 0;
+  try { ctx.drawImage(source, 0, 0, tw, th); }
+  catch { return Promise.resolve({ thumb: null, bright: 0, variance: 0 }); }
+  let bright = 0, variance = 0;
   try {
     const d = ctx.getImageData(0, 0, tw, th).data;
-    let sum = 0;
     const samples = [];
-    for (let i = 0; i < d.length; i += 16) { // 抽样，避免大图耗时
+    let sum = 0;
+    for (let i = 0; i < d.length; i += 16) {
       const v = (d[i] + d[i + 1] + d[i + 2]) / 3;
-      sum += v; samples.push(v);
+      samples.push(v); sum += v;
     }
     bright = samples.length ? sum / samples.length : 0;
     let ss = 0;
@@ -85,17 +90,12 @@ function drawToJpeg(source, w, h) {
   });
 }
 
-/** 全黑 / 未出画：亮度极低且几乎无方差。暗画面但有内容（variance 大）算成功。 */
 function isBlankFrame(shot) {
   if (!shot || !shot.thumb) return true;
   if (shot.bright >= 2) return false;
   return !(shot.variance >= 4);
 }
 
-/**
- * 构造用于取帧的 <video>：一开始就挂进 DOM，给真实像素尺寸。
- * WebKit 对 1×1 / opacity:0 / 未入 DOM 的元素不会解码出可绘制帧。
- */
 function makeCaptureVideo() {
   const video = document.createElement("video");
   video.preload = "auto";
@@ -106,143 +106,174 @@ function makeCaptureVideo() {
   video.setAttribute("webkit-playsinline", "");
   video.setAttribute("muted", "");
   video.controls = false;
-  video.disablePictureInPicture = true;
-  try { video.disableRemotePlayback = true; } catch { /* ignore */ }
+  try { video.disablePictureInPicture = true; } catch { /* */ }
+  try { video.disableRemotePlayback = true; } catch { /* */ }
+  // 真实尺寸 + 极低透明：WebKit 对 1×1 / opacity:0 / 未入 DOM 不出可绘帧
   video.style.cssText = "position:fixed;left:0;top:0;width:160px;height:90px;opacity:0.01;pointer-events:none;z-index:-1;border:0;";
-  document.body.appendChild(video);
+  if (document.body) document.body.appendChild(video);
   return video;
-}
-
-async function grabFrame(video, { target, budget }) {
-  // 1) 先 play 强制解码（iOS 没播过的 video drawImage 必黑）
-  let played = false;
-  try {
-    const p = video.play();
-    if (p && typeof p.then === "function") await p;
-    played = true;
-  } catch {
-    // 自动播放被拒：仍尝试后续 seek；部分环境 seeked 后也能出帧
-  }
-
-  await waitForFrame(video, Math.min(budget, 4000));
-
-  // 2) seek 到目标时间，再等一帧
-  const seekMs = Math.min(budget, 5000);
-  const seeked = waitEvent(video, ["seeked"], seekMs);
-  try { video.currentTime = target; } catch { /* 不可 seek 就用当前帧 */ }
-  await seeked;
-  await waitForFrame(video, Math.min(budget, 4000));
-
-  if (played) {
-    try { video.pause(); } catch { /* ignore */ }
-  }
-
-  if (video.readyState < 2) await waitEvent(video, ["loadeddata", "canplay"], 1500);
-
-  let shot = await drawToJpeg(video, video.videoWidth || 160, video.videoHeight || 90);
-  if (isBlankFrame(shot) && played) {
-    // 再短播一截兜底（某些编码 seek 后第一帧仍黑）
-    try {
-      await video.play();
-      await waitForFrame(video, 2500);
-      video.pause();
-      shot = await drawToJpeg(video, video.videoWidth || 160, video.videoHeight || 90);
-    } catch { /* keep first */ }
-  }
-  return shot;
 }
 
 function cleanupVideo(video, url) {
   try {
     if (video) {
-      try { video.pause(); } catch { /* ignore */ }
+      try { video.pause(); } catch { /* */ }
       video.removeAttribute("src");
-      try { video.load(); } catch { /* ignore */ }
+      try { video.load(); } catch { /* */ }
       video.remove();
     }
-  } catch { /* ignore */ }
-  try { if (url) URL.revokeObjectURL(url); } catch { /* ignore */ }
+  } catch { /* */ }
+  try { if (url) URL.revokeObjectURL(url); } catch { /* */ }
 }
 
 /**
- * 从 File/Blob 提取视频首帧 + 尺寸 + 时长。
- * @returns {Promise<{w:number,h:number,dur:number|null,thumb:Uint8Array|null,reason?:string}>}
+ * 在**当前调用栈**里尽快挂上 src 并 play()——文件选择的用户手势还在时最关键。
+ * 返回句柄，稍后 await finishCapture(handle)。
  */
-export async function captureCover(file, { mime, timeout, at } = {}) {
-  const out = { w: 0, h: 0, dur: null, thumb: null };
-  if (!file || typeof document === "undefined") return { ...out, reason: "nofile" };
-  if (typeof document.body === "undefined" || !document.body) return { ...out, reason: "nobody" };
-  const type = mime || file.type || "";
-  const size = Number(file.size) || 0;
-  const budget = timeout != null ? timeout
-    : (size > 500 * 1024 * 1024 ? 30000 : size > 80 * 1024 * 1024 ? 20000 : DEFAULT_TIMEOUT);
-
-  let url = null;
-  let video = null;
-  try {
-    url = URL.createObjectURL(file);
-    video = makeCaptureVideo();
-    video.src = url;
-    if (video.load) video.load();
-
-    const metaOk = await waitEvent(video, ["loadedmetadata"], Math.min(budget, 15000));
-    out.w = video.videoWidth || 0;
-    out.h = video.videoHeight || 0;
-    out.dur = Number.isFinite(video.duration) ? video.duration : null;
-    if (!metaOk) return { ...out, reason: "metatimeout" };
-    if (!out.w || !out.h) return { ...out, reason: "nocodec" };
-
-    const target = at == null ? frameTime(out.dur) : at;
-    const shot = await grabFrame(video, { target, budget });
-    if (isBlankFrame(shot)) return { ...out, reason: "blank" };
-    out.thumb = shot.thumb;
-    return out;
-  } catch (err) {
-    out.reason = (err && err.name) || "error";
-    return out;
-  } finally {
-    cleanupVideo(video, url);
-    void type;
+export function beginCapture(file, { mime } = {}) {
+  const type = mime || (file && file.type) || "";
+  const size = Number(file && file.size) || 0;
+  const budget = size > 500 * 1024 * 1024 ? 30000
+    : size > 80 * 1024 * 1024 ? 20000 : DEFAULT_TIMEOUT;
+  const out = { w: 0, h: 0, dur: null, thumb: null, t0: Date.now() };
+  if (!file || typeof document === "undefined" || !document.body) {
+    return { promise: Promise.resolve({ ...out, reason: "nofile" }), cancel() {} };
   }
+  /* 测试/异常路径可能塞进非 Blob；createObjectURL 会直接抛 */
+  if (typeof Blob === "undefined" || !(file instanceof Blob)) {
+    return { promise: Promise.resolve({ ...out, reason: "nofile" }), cancel() {} };
+  }
+  let url;
+  try { url = URL.createObjectURL(file); }
+  catch {
+    return { promise: Promise.resolve({ ...out, reason: "nofile" }), cancel() {} };
+  }
+  const video = makeCaptureVideo();
+  let cancelled = false;
+  // 同步挂 src；立刻尝试 play（手势窗口）
+  video.src = url;
+  if (type) try { video.setAttribute("type", type); } catch { /* */ }
+  if (video.load) video.load();
+  let playP = null;
+  try { playP = video.play(); } catch { playP = null; }
+
+  const promise = (async () => {
+    try {
+      if (playP && typeof playP.then === "function") {
+        try { await playP; } catch { /* 自动播放被拒：后面还有 seek 路径 */ }
+      }
+      /* 元数据可能在挂监听之前就到了（本地 File 极快）——先看 readyState，再等事件 */
+      if (!(video.readyState >= 1 && video.videoWidth)) {
+        const metaOk = await waitEvent(video, ["loadedmetadata", "loadeddata"], Math.min(budget, 15000));
+        if (!metaOk && !(video.readyState >= 1 && video.videoWidth)) {
+          out.w = video.videoWidth || 0;
+          out.h = video.videoHeight || 0;
+          out.dur = Number.isFinite(video.duration) ? video.duration : null;
+          return { ...out, reason: "metatimeout" };
+        }
+      }
+      if (cancelled) return { ...out, reason: "cancelled" };
+      out.w = video.videoWidth || 0;
+      out.h = video.videoHeight || 0;
+      out.dur = Number.isFinite(video.duration) ? video.duration : null;
+      if (!out.w || !out.h) return { ...out, reason: "nocodec" };
+
+      await waitForFrame(video, Math.min(budget, 4000));
+      const target = frameTime(out.dur);
+      const seeked = waitEvent(video, ["seeked"], Math.min(budget, 5000));
+      try { video.currentTime = target; } catch { /* */ }
+      await seeked;
+      await waitForFrame(video, Math.min(budget, 4000));
+      try { video.pause(); } catch { /* */ }
+
+      let shot = await drawToJpeg(video, out.w, out.h);
+      if (isBlankFrame(shot)) {
+        // 再短促 play 一次（仍只在 0.1s 附近）
+        try {
+          await video.play();
+          await waitForFrame(video, 2500);
+          video.pause();
+          shot = await drawToJpeg(video, out.w, out.h);
+        } catch { /* */ }
+      }
+      if (isBlankFrame(shot)) return { ...out, reason: "blank", ms: Date.now() - out.t0 };
+      out.thumb = shot.thumb;
+      out.ms = Date.now() - out.t0;
+      return out;
+    } catch (err) {
+      return { ...out, reason: (err && err.name) || "error", ms: Date.now() - out.t0 };
+    } finally {
+      cleanupVideo(video, url);
+    }
+  })();
+
+  return {
+    promise,
+    cancel() { cancelled = true; cleanupVideo(video, url); },
+  };
 }
 
-/**
- * 同 captureCover，输入是已存在的同源 URL（blob: 或 /__media/ 流式 URL）。
- * 导出给 backfill / 测试使用。
- */
+/** 兼容旧调用：内部走 beginCapture（若已过手势窗口，仍尽量取帧） */
+export async function captureCover(file, { mime, timeout, at } = {}) {
+  void at; void timeout;
+  const h = beginCapture(file, { mime });
+  return h.promise;
+}
+
+/** 已有同源 URL（blob: / 流式）：同样入 DOM + 短 play + seek 0.1s */
 export async function captureCoverFromUrl(src, mime, { timeout = DEFAULT_TIMEOUT, at } = {}) {
-  const out = { w: 0, h: 0, dur: null, thumb: null };
+  const out = { w: 0, h: 0, dur: null, thumb: null, t0: Date.now() };
   if (!src || typeof document === "undefined" || !document.body) return { ...out, reason: "nofile" };
   let video = null;
   try {
     video = makeCaptureVideo();
     video.src = src;
+    if (mime) try { video.setAttribute("type", mime); } catch { /* */ }
     if (video.load) video.load();
+    try { const p = video.play(); if (p && p.then) await p; } catch { /* */ }
 
-    const metaOk = await waitEvent(video, ["loadedmetadata"], Math.min(timeout, 15000));
+    if (!(video.readyState >= 1 && video.videoWidth)) {
+      const metaOk = await waitEvent(video, ["loadedmetadata", "loadeddata"], Math.min(timeout, 15000));
+      if (!metaOk && !(video.readyState >= 1 && video.videoWidth)) {
+        out.w = video.videoWidth || 0;
+        out.h = video.videoHeight || 0;
+        out.dur = Number.isFinite(video.duration) ? video.duration : null;
+        return { ...out, reason: "metatimeout" };
+      }
+    }
     out.w = video.videoWidth || 0;
     out.h = video.videoHeight || 0;
     out.dur = Number.isFinite(video.duration) ? video.duration : null;
-    if (!metaOk) return { ...out, reason: "metatimeout" };
     if (!out.w || !out.h) return { ...out, reason: "nocodec" };
 
+    await waitForFrame(video, Math.min(timeout, 4000));
     const target = at == null ? frameTime(out.dur) : at;
-    const shot = await grabFrame(video, { target, budget: timeout });
-    if (isBlankFrame(shot)) return { ...out, reason: "blank" };
+    const seeked = waitEvent(video, ["seeked"], Math.min(timeout, 5000));
+    try { video.currentTime = target; } catch { /* */ }
+    await seeked;
+    await waitForFrame(video, Math.min(timeout, 4000));
+    try { video.pause(); } catch { /* */ }
+
+    let shot = await drawToJpeg(video, out.w, out.h);
+    if (isBlankFrame(shot)) {
+      try {
+        await video.play();
+        await waitForFrame(video, 2500);
+        video.pause();
+        shot = await drawToJpeg(video, out.w, out.h);
+      } catch { /* */ }
+    }
+    if (isBlankFrame(shot)) return { ...out, reason: "blank", ms: Date.now() - out.t0 };
     out.thumb = shot.thumb;
-    void mime;
+    out.ms = Date.now() - out.t0;
     return out;
   } catch (err) {
-    out.reason = (err && err.name) || "error";
-    return out;
+    return { ...out, reason: (err && err.name) || "error", ms: Date.now() - out.t0 };
   } finally {
     cleanupVideo(video, null);
   }
 }
 
-export const LEGACY_INLINE_MAX = 12 * 1024 * 1024;
-
-/* 本会话内已失败的条目；COVER_GEN 变化时整表清空，升级后自动重试 */
 const sessionFailed = new Set();
 let sessionGen = COVER_GEN;
 function ensureSessionGen() {
@@ -254,42 +285,66 @@ function cachedUrl(media, id) {
   try { return media.url("video", id) || null; } catch { return null; }
 }
 
+/** 本算法世代是否已试过（成功有 hasThumb；失败有 coverFailGen） */
+function alreadyTried(it) {
+  if (it.hasThumb) return true;
+  const g = Number(it.coverFailGen) || 0;
+  return g >= COVER_GEN;
+}
+
 /**
- * 已导入但没有封面的视频：懒补封面。不重导入、不动原件。
- * 失败时把 reason 写入 item.coverFail（仅元数据，无 UI），便于真机诊断；不阻止下次升级后重试。
+ * 懒补：一次最多 limit 条（调用方应传 1），每种算法世代每条只试一次。
+ * 后台（hidden）直接跳过，不读媒体。
  */
-export async function backfillVideoCovers(vault, { limit = 8, onOne, media, legacyMaxBytes = LEGACY_INLINE_MAX } = {}) {
+export async function backfillVideoCovers(vault, {
+  limit = 1, onOne, media, legacyMaxBytes = LEGACY_INLINE_MAX,
+} = {}) {
   ensureSessionGen();
-  const res = { fixed: 0, skipped: 0, failed: 0, deferred: 0, remaining: 0, unavailable: false };
+  const res = {
+    fixed: 0, skipped: 0, failed: 0, deferred: 0, remaining: 0, unavailable: false, tried: 0,
+  };
   const all = (vault.items || []).filter((it) => it.kind === "video" && !it.hasThumb && !it.trashedAt);
-  res.remaining = all.length;
-  if (!all.length) return res;
-  const todo = all.filter((it) => !sessionFailed.has(it.id));
-  if (!todo.length) return res;
-  const batch = todo.slice(0, limit);
+  const pending = all.filter((it) => !alreadyTried(it) && !sessionFailed.has(it.id));
+  res.remaining = pending.length;
+  if (!pending.length) return res;
+  if (typeof document !== "undefined" && document.visibilityState === "hidden") {
+    res.skipped = pending.length;
+    return res;
+  }
 
   let Stream = null;
-  try { Stream = await import("./stream.js"); } catch { /* 离线/旧 SW */ }
+  try { Stream = await import("./stream.js"); } catch { /* */ }
   const streamOk = !!(Stream && typeof Stream.urlFor === "function");
+  const batch = pending.slice(0, Math.max(1, limit));
 
   for (const it of batch) {
     let release = null;
+    res.tried++;
     try {
-      if (typeof document !== "undefined" && document.visibilityState === "hidden") {
-        res.skipped++;
-        continue; // 后台不取帧：iOS 会挂起媒体，且 grant 可能已 revoke
-      }
+      if (document.visibilityState === "hidden") { res.skipped++; break; }
       const size = Number(it.size) || 0;
       let cover = null;
       let chunked = false;
       try { chunked = await vault.isChunked(it.id); } catch { chunked = false; }
 
       if (chunked) {
-        if (!streamOk) { res.unavailable = true; res.skipped++; continue; }
-        const url = await Stream.urlFor(it.id);
-        if (!url) { res.skipped++; continue; }
-        cover = await captureCoverFromUrl(url, it.mime);
-        release = () => { try { Stream.releaseItem(it.id); } catch { /* ignore */ } };
+        // 小分块：拼成 Blob URL 取帧（有界）；大分块：流式 URL 只 seek 0.1s
+        if (size > 0 && size <= legacyMaxBytes && typeof vault.readForExport === "function") {
+          const bytes = await vault.readForExport(it.id);
+          if (bytes && bytes.length) {
+            cover = await captureCover(new Blob([bytes], { type: it.mime || "video/mp4" }), { mime: it.mime });
+          }
+        }
+        if ((!cover || !cover.thumb) && streamOk) {
+          const url = await Stream.urlFor(it.id);
+          if (!url) { res.unavailable = true; res.skipped++; continue; }
+          cover = await captureCoverFromUrl(url, it.mime);
+          release = () => { try { Stream.releaseItem(it.id); } catch { /* */ } };
+        } else if (!cover || !cover.thumb) {
+          if (!streamOk) res.unavailable = true;
+          res.skipped++;
+          continue;
+        }
       } else {
         const hot = cachedUrl(media, it.id);
         if (hot) cover = await captureCoverFromUrl(hot, it.mime);
@@ -298,6 +353,7 @@ export async function backfillVideoCovers(vault, { limit = 8, onOne, media, lega
           if (!bytes) { res.skipped++; continue; }
           cover = await captureCover(new Blob([bytes], { type: it.mime || "video/mp4" }), { mime: it.mime });
         } else {
+          // 大 legacy：等用户打开播放后 media 里有 URL 再补；本轮记 deferred，不写 coverFail
           res.deferred++;
           continue;
         }
@@ -306,29 +362,63 @@ export async function backfillVideoCovers(vault, { limit = 8, onOne, media, lega
       if (!cover || !cover.thumb) {
         res.failed++;
         sessionFailed.add(it.id);
-        try {
-          it.coverFail = (cover && cover.reason) || "blank";
-          it.coverFailAt = Date.now();
-          it.coverFailGen = COVER_GEN;
-          await vault.saveItem(it);
-        } catch { /* 诊断字段写失败不影响主流程 */ }
+        it.coverFail = (cover && cover.reason) || "blank";
+        it.coverFailAt = Date.now();
+        it.coverFailGen = COVER_GEN;
+        it.coverFailMs = cover && cover.ms || null;
+        try { await vault.saveItem(it); } catch { /* */ }
         continue;
       }
+
       await vault.putThumb(it.id, cover.thumb);
       it.hasThumb = true;
       it.w = it.w || cover.w; it.h = it.h || cover.h;
       if (it.dur == null && cover.dur != null) it.dur = cover.dur;
-      if (it.coverFail) { delete it.coverFail; delete it.coverFailAt; delete it.coverFailGen; }
+      delete it.coverFail; delete it.coverFailAt; delete it.coverFailGen; delete it.coverFailMs;
       await vault.saveItem(it);
       res.fixed++;
       onOne && onOne(it);
-    } catch {
+    } catch (err) {
       res.failed++;
       sessionFailed.add(it.id);
+      try {
+        it.coverFail = (err && err.name) || "error";
+        it.coverFailAt = Date.now();
+        it.coverFailGen = COVER_GEN;
+        await vault.saveItem(it);
+      } catch { /* */ }
     } finally { if (release) release(); }
   }
-  res.remaining = Math.max(0, (vault.items || []).filter((it) => it.kind === "video" && !it.hasThumb && !it.trashedAt).length);
+
+  res.remaining = (vault.items || []).filter(
+    (it) => it.kind === "video" && !it.hasThumb && !it.trashedAt && !alreadyTried(it),
+  ).length;
   return res;
 }
 
 export function _resetBackfillSession() { sessionFailed.clear(); sessionGen = COVER_GEN; }
+
+/** 诊断：列出缺封面 / 失败条目（不含明文、不含密钥） */
+export function diagnoseCovers(vault) {
+  const items = (vault && vault.items) || [];
+  const videos = items.filter((it) => it.kind === "video" && !it.trashedAt);
+  return {
+    coverGen: COVER_GEN,
+    totalVideos: videos.length,
+    withThumb: videos.filter((it) => it.hasThumb).length,
+    missing: videos.filter((it) => !it.hasThumb).length,
+    rows: videos.map((it) => ({
+      id: it.id,
+      name: it.name,
+      size: it.size,
+      mime: it.mime,
+      hasThumb: !!it.hasThumb,
+      dur: it.dur,
+      w: it.w, h: it.h,
+      coverFail: it.coverFail || null,
+      coverFailGen: it.coverFailGen || null,
+      coverFailAt: it.coverFailAt || null,
+      coverFailMs: it.coverFailMs || null,
+    })),
+  };
+}
