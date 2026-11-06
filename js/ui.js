@@ -2468,7 +2468,8 @@ async function afterUnlock(){
     if(purged) console.info("已清理到期回收站项目", purged);
   }catch(err){ console.warn("回收站清理失败", err); }
   openAlbum();
-  lazyBackfillCovers();   /* 2.1.2：旧视频没有封面 → 用流式 URL 后台懒补，不重导入、不动原件 */
+  /* 每次解锁清一次本会话失败记忆：上一版 WebKit 取帧失败的条目会再试；coverFail 元数据仅诊断用，不拦重试 */
+  import("./core/cover.js").then((C)=>{ try{ C._resetBackfillSession(); }catch(_){} lazyBackfillCovers(); }).catch(()=>lazyBackfillCovers());
   checkUpdate(false);
 }
 /* 2.1.2：已导入但没有封面的视频，懒补首帧 → 加密写入 thumbs。
@@ -2480,6 +2481,7 @@ let coverBackfillBusy=false;
 async function lazyBackfillCovers(){
   if(coverBackfillBusy) return;
   coverBackfillBusy=true;
+  let again=false;
   try{
     const Cover=await import("./core/cover.js");
     const res=await Cover.backfillVideoCovers(vault,{limit:6, media});
@@ -2488,8 +2490,11 @@ async function lazyBackfillCovers(){
       /* 查看器打开时不要重渲染底下的网格（会打断正在看的条目）；数据已 hydrate，下次渲染自然带封面 */
       if(!document.querySelector("#layer .viewer")) render();
     }
+    /* 还有剩且不是「SW 暂不可用」：稍后继续下一批 */
+    again=!!(res&&res.remaining>0&&!res.unavailable&&document.visibilityState!=="hidden");
   }catch(err){ console.warn("封面懒补跳过", err); }
   finally{ coverBackfillBusy=false; }
+  if(again) setTimeout(()=>{ lazyBackfillCovers(); }, 800);
 }
 /** 紧急清除码：立即清空本机全部内容（含解锁码），回到首次使用状态 */
 async function emergencyWipe(){

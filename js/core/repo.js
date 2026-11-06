@@ -588,6 +588,11 @@ export class Vault {
         } else if (kind === "video") {
           const meta = await Cover.captureCover(file, { mime });
           item.w = meta.w; item.h = meta.h; item.dur = meta.dur; thumb = meta.thumb;
+          if (!thumb && meta.reason) {
+            item.coverFail = meta.reason;
+            item.coverFailAt = now();
+            item.coverFailGen = Cover.COVER_GEN;
+          }
         }
 
         // 2) 分块加密写入：File.slice 逐块读 → 逐块加密 → 逐块提交，内存峰值 ≈ 一块
@@ -598,7 +603,10 @@ export class Vault {
         });
 
         // 3) 缩略图/首帧仍加密写入 thumbs store
-        if (thumb) { await this.putThumb(id, thumb); item.hasThumb = true; }
+        if (thumb) {
+          await this.putThumb(id, thumb); item.hasThumb = true;
+          delete item.coverFail; delete item.coverFailAt; delete item.coverFailGen;
+        }
 
         // 4) 条目最后提交：这一步成功才算导入完成（此前失败都不可见、可回滚）
         this.items.unshift(item);
