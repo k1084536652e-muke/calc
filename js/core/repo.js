@@ -7,6 +7,8 @@
  */
 
 import * as DB from "./db.js";
+import * as Chunks from "./chunks.js";
+import * as Cover from "./cover.js";
 import {
   KDF_ITERATIONS, SALT_BYTES, DEK_BYTES,
   randomBytes, deriveKek, generateDek, importDek,
@@ -20,7 +22,17 @@ export const DEFAULT_SETTINGS = {
   slideInt: "3",       // "2" | "3" | "5" | "8"
 };
 
+/**
+ * 旧口径（4–9 位）：**只用于「验证已存在的码」**——2.0.0 / 2.1.1 的存量用户可能设的就是 4~5 位，
+ * 解锁、二次确认、清除码校验必须继续接受，否则老用户直接被锁在门外（绝不能丢数据/丢访问权）。
+ * 也用于迁移模块与测试播种旧数据（显式传 allowLegacy，见下）。
+ */
 export const PIN_RE = /^\d{4,9}$/;
+/**
+ * 新口径（6–9 位）：**只用于「设置新码」**（首次配置 / 修改解锁码 / 设置清除码）。
+ * DESIGN-NOTES §52 要求 4–9 位是旧版；2.1.2 起 UI 与核心都收紧到 6–9，核心不能只有 UI 拦。
+ */
+export const NEW_PIN_RE = /^\d{6,9}$/;
 
 const now = () => Date.now();
 const newId = (prefix = "") => prefix + Array.from(randomBytes(8), (b) => b.toString(16).padStart(2, "0")).join("");
@@ -57,9 +69,14 @@ export class Vault {
     await DB.put("auth", { k: "vault", v: this.auth });
   }
 
-  /** 首次配置：生成 DEK 并用解锁码包裹；同时写入默认设置 */
-  async create(pin) {
-    if (!PIN_RE.test(String(pin))) throw new Error("解锁码须为 4–9 位数字");
+  /**
+   * 首次配置：生成 DEK 并用解锁码包裹；同时写入默认设置。
+   * `allowLegacy:true` **只给迁移模块/测试**播种「旧版 4~5 位码」的数据用；UI 永不传。
+   */
+  async create(pin, { allowLegacy = false } = {}) {
+    if (!(allowLegacy ? PIN_RE : NEW_PIN_RE).test(String(pin))) {
+      throw new Error("解锁码须为 6–9 位数字");
+    }
     const salt = randomBytes(SALT_BYTES);
     const kek = await deriveKek(pin, salt, KDF_ITERATIONS);
     const dek = await generateDek();
@@ -67,6 +84,7 @@ export class Vault {
     this.auth = { version: 1, salt, iterations: KDF_ITERATIONS, wrappedDek, createdAt: now() };
     await this.#saveAuth();
     this.dekKey = dek.key;
+    Chunks.setChunkKey(this.dekKey);
     this.items = [];
     this.folders = [];
     this.settings = { ...DEFAULT_SETTINGS };
@@ -87,6 +105,7 @@ export class Vault {
       return false;   // 认证失败 = 解锁码不对
     }
     this.dekKey = await importDek(raw);
+    Chunks.setChunkKey(this.dekKey);
     await this.loadAll();
     return true;
   }
@@ -107,6 +126,7 @@ export class Vault {
   /** 锁定：丢弃 DEK 与全部内存明文 */
   lock() {
     this.dekKey = null;
+    Chunks.clearChunkKey();
     this.items = [];
     this.folders = [];
     this.settings = { ...DEFAULT_SETTINGS };
@@ -201,6 +221,10 @@ export class Vault {
       ops.push({ type: "del", store: "docs", key: id });
     }
     await DB.writeBatch(ops);
+    // 分块大文件：条目先删（避免悬空引用），再清分块（meta 先删 → 立即不可读 → 块逐个删干净）
+    try {
+      await Chunks.deleteChunkSets([...idset]);
+    } catch { /* 残留块由启动时的 cleanupOrphans 兜底，不影响条目已删除 */ }
     this.items = this.items.filter((it) => !idset.has(it.id));
     // 文件夹封面候选同步剔除
     let touched = false;
@@ -227,9 +251,74 @@ export class Vault {
 
   async readBlob(id) {
     const key = this.#needKey();
+    // 契约：分块大文件不走这里（整份解密会把内存打爆）。调用方应改用 readChunkRange / chunkStream。
+    if (await Chunks.isChunked(id)) {
+      throw new Chunks.ChunkError("该条目使用分块存储，请使用 readChunkRange/chunkStream 读取", "CHUNKED");
+    }
     const row = await DB.get("blobs", id);
     if (!row) return null;
     return open(key, row, aadFor("blob", id));
+  }
+
+  // ---------- 分块大文件（2.1.2 底座，媒体层/播放器后续接入） ----------
+
+  /** 该条目是否以分块格式存储 */
+  isChunked(id) { return Chunks.isChunked(id); }
+
+  /**
+   * **仅导出用**：一次性取回该条目的全部明文字节（legacy 单 blob 直接解一个信封；
+   * 分块条目按块解密后拼成一份 Uint8Array）。字节与用户原始文件**完全一致**，
+   * 不解码、不重编码、不剥 EXIF —— 导出的 SHA-256 必须等于导入时源文件的 SHA-256。
+   *
+   * 约定（别拿它当通用读取接口）：
+   *  - 播放 / 预览 / 缩略图**一律不许**走这里：分块条目的意义就是「永远不整份解密」，
+   *    `readBlob()` 对分块条目继续抛 CHUNKED 的护栏保持不变；
+   *  - 这里必然会把整份明文放进内存（大视频导出 = 整份缓冲），属于**已知且延期**的限制，
+   *    不要在 UI 上承诺「大视频导出不占内存」。
+   */
+  async readForExport(id) {
+    this.#needKey();
+    if (!(await Chunks.isChunked(id))) return this.readBlob(id);
+    const meta = await Chunks.getChunkMeta(id, { readyOnly: true });
+    if (!meta) return null;
+    const part = await Chunks.readRange(id, 0, meta.size, { key: this.dekKey });
+    return part && part.bytes ? part.bytes : new Uint8Array(0);
+  }
+
+  /** 分块清单（含 size/total/chunkSize，用于 Range 响应头） */
+  readChunkMeta(id) { return Chunks.getChunkMeta(id, { readyOnly: true }); }
+
+  /** 按字节区间读取（只解密覆盖区间的块） */
+  async readChunkRange(id, start = 0, end = Infinity) {
+    this.#needKey();
+    return Chunks.readRange(id, start, end, { key: this.dekKey });
+  }
+
+  /** 按字节区间流式读取（SW Range 响应用，内存里只有一块明文） */
+  readChunkStream(id, range) {
+    this.#needKey();
+    return Chunks.chunkStream(id, { ...range, key: this.dekKey });
+  }
+
+  /**
+   * 写入分块大文件：从 File/Blob 逐块读、逐块加密提交，最后 chunkmeta 作为唯一提交点。
+   * 返回值 { meta } 或抛 ChunkError（CANCELLED / QUOTA / BAD_SIZE / INCOMPLETE）。
+   */
+  async putChunkedFile(id, file, { onProgress, cancelled, chunkSize, kind, mime } = {}) {
+    this.#needKey();
+    const meta = await Chunks.importFileChunked(id, file, {
+      onProgress, cancelled, chunkSize, kind, mime, key: this.dekKey,
+    });
+    return meta;
+  }
+
+  /** 启动时清理中断的导入留下的孤儿分块（不删正在导入的：有 grace 宽限） */
+  async cleanupChunkOrphans(graceMs) {
+    const ids = new Set(this.items.map((it) => it.id));
+    return Chunks.cleanupOrphans({
+      graceMs,
+      isReferenced: async (id) => ids.has(id) || !!(await DB.get("items", id)),
+    });
   }
 
   async putBlob(id, bytes) {
@@ -350,9 +439,11 @@ export class Vault {
 
   // ---------- 安全相关 ----------
 
-  /** 修改解锁码：只重新包裹 DEK，不重新加密任何数据 */
-  async changePin(current, next) {
-    if (!PIN_RE.test(String(next))) throw new Error("解锁码须为 4–9 位数字");
+  /** 修改解锁码：只重新包裹 DEK，不重新加密任何数据（当前码允许旧口径，新码必须 6–9 位） */
+  async changePin(current, next, { allowLegacy = false } = {}) {
+    if (!(allowLegacy ? PIN_RE : NEW_PIN_RE).test(String(next))) {
+      throw new Error("解锁码须为 6–9 位数字");
+    }
     const kekOld = await deriveKek(current, this.auth.salt, this.auth.iterations || KDF_ITERATIONS);
     let raw;
     try {
@@ -367,9 +458,11 @@ export class Vault {
     return true;
   }
 
-  /** 紧急清除码：单独盐 + 包裹一个随机标记；不存码、不存哈希 */
-  async setWipeCode(code) {
-    if (!PIN_RE.test(String(code))) throw new Error("清除码须为 4–9 位数字");
+  /** 紧急清除码：单独盐 + 包裹一个随机标记；不存码、不存哈希（新设必须 6–9 位） */
+  async setWipeCode(code, { allowLegacy = false } = {}) {
+    if (!(allowLegacy ? PIN_RE : NEW_PIN_RE).test(String(code))) {
+      throw new Error("清除码须为 6–9 位数字");
+    }
     // 必须与解锁码不同：若该码能解包 DEK，说明它就是解锁码
     const probeKek = await deriveKek(code, this.auth.salt, this.auth.iterations || KDF_ITERATIONS);
     try {
@@ -412,7 +505,7 @@ export class Vault {
 
   /** 清空全部数据（设置页）：删内容与文件夹，保留解锁码与设置 */
   async clearContent() {
-    await DB.clearStores(["items", "thumbs", "blobs", "docs", "folders"]);
+    await DB.clearStores(["items", "thumbs", "blobs", "docs", "folders", "chunks", "chunkmeta"]);
     this.items = [];
     this.folders = [];
     return true;
@@ -420,9 +513,10 @@ export class Vault {
 
   /** 紧急清除：删除全部内容 + 解锁码 / 清除码配置（回到首次使用状态） */
   async wipeAll() {
-    await DB.clearStores(["items", "thumbs", "blobs", "docs", "folders", "prefs", "auth", "meta"]);
+    await DB.clearStores(["items", "thumbs", "blobs", "docs", "folders", "chunks", "chunkmeta", "prefs", "auth", "meta"]);
     this.auth = null;
     this.dekKey = null;
+    Chunks.clearChunkKey();
     this.items = [];
     this.folders = [];
     this.settings = { ...DEFAULT_SETTINGS };
@@ -441,23 +535,28 @@ export class Vault {
     const total = files.length;
     const imported = [];
     const failed = [];
+    let attempted = 0;
+    let quotaHit = null;
 
     for (let i = 0; i < total; i++) {
       if (cancelled && cancelled()) break;
+      if (!this.dekKey) break;           // 已锁定：不再处理后续文件（每一个都会因无 key 抛错）
       const file = files[i];
-      const name = file.name || "未命名";
+      const name = (file && file.name) || "未命名";
       const kind = /^image\//.test(file.type) ? "photo" : /^video\//.test(file.type) ? "video" : "file";
+      const id = newId(kind === "photo" ? "p" : kind === "video" ? "v" : "x");
+      attempted++;
       onProgress && onProgress({ index: i + 1, total, name, pct: (i / total) * 100 });
 
       try {
-        const buffer = await file.arrayBuffer();
-        const id = newId(kind === "photo" ? "p" : kind === "video" ? "v" : "x");
+        // 1) 元数据 + 缩略图：直接从 File 解码（图片用 createImageBitmap / <img>，
+        //    视频用 cover.js 从 File 的 objectURL 取首帧），**不做 file.arrayBuffer()**
         const item = {
           id,
           kind,
           name,
           mime: file.type || "application/octet-stream",
-          size: file.size || buffer.byteLength,
+          size: file.size || 0,
           w: 0, h: 0, dur: null,
           createdAt: now(),
           updatedAt: now(),
@@ -465,43 +564,69 @@ export class Vault {
           trashedAt: null,
           hasThumb: false,
         };
-
+        let thumb = null;
         if (kind === "photo") {
-          const meta = await decodeImage(buffer);
-          item.w = meta.w; item.h = meta.h;
-          if (meta.thumb) { await this.putThumb(id, meta.thumb); item.hasThumb = true; }
+          const meta = await decodeImage(file);
+          item.w = meta.w; item.h = meta.h; thumb = meta.thumb;
         } else if (kind === "video") {
-          const meta = await decodeVideo(buffer, file.type);
-          item.w = meta.w; item.h = meta.h; item.dur = meta.dur;
-          if (meta.thumb) { await this.putThumb(id, meta.thumb); item.hasThumb = true; }
+          const meta = await Cover.captureCover(file, { mime: file.type });
+          item.w = meta.w; item.h = meta.h; item.dur = meta.dur; thumb = meta.thumb;
         }
 
-        await this.putBlob(id, buffer);
+        // 2) 分块加密写入：File.slice 逐块读 → 逐块加密 → 逐块提交，内存峰值 ≈ 一块
+        await this.putChunkedFile(id, file, {
+          kind, mime: item.mime, cancelled,
+          onProgress: ({ pct }) => onProgress
+            && onProgress({ index: i + 1, total, name, pct: (i / total) * 100 + (pct || 0) / total }),
+        });
+
+        // 3) 缩略图/首帧仍加密写入 thumbs store
+        if (thumb) { await this.putThumb(id, thumb); item.hasThumb = true; }
+
+        // 4) 条目最后提交：这一步成功才算导入完成（此前失败都不可见、可回滚）
         this.items.unshift(item);
         await this.saveItem(item);
         imported.push(item);
       } catch (err) {
-        failed.push({ name, error: err });
-        if (quotaError(err)) throw Object.assign(new Error("本机存储空间不足，未能导入「" + name + "」"), { quota: true });
+        // 失败 / 取消 / 配额：回滚本次已写入的块与缩略图，绝不留半截数据
+        try { await Chunks.discardChunks(id); } catch { /* ignore */ }
+        try { await DB.del("thumbs", id); } catch { /* ignore */ }
+        // saveItem 抛错时内存索引里可能已经 unshift 了这条：一并撤掉，避免「列表里有、库里没有」
+        if (this.items.some((x) => x.id === id)) this.items = this.items.filter((x) => x.id !== id);
+        if (cancelled && cancelled()) break;                 // 用户取消：不计失败，直接停
+        // 锁定（自动锁 / 手动锁）导致在途导入中断：立刻停，不继续写明文、不提交后续条目
+        if (!this.dekKey) break;
+        failed.push({ name, error: err, code: (err && err.code) || (err && err.name) || "ERROR" });
+        if (Chunks.isQuotaError(err) || quotaError(err)) { quotaHit = err; break; }
       }
       onProgress && onProgress({ index: i + 1, total, name, pct: ((i + 1) / total) * 100 });
+    }
+
+    // 配额中断：没轮到的文件也明确计入 failed，保证「成功 N / 失败 M」之和 = 总数，
+    // 不给用户「剩下 80 个去哪了」的静默截断。
+    if (quotaHit && attempted < total) {
+      const reason = new Error("本机存储空间不足，尚未导入");
+      for (let k = attempted; k < total; k++) {
+        failed.push({ name: (files[k] && files[k].name) || "未命名", error: reason, code: "QUOTA", skipped: true });
+      }
     }
     return { imported, failed };
   }
 }
 
-/** 解码图片：取尺寸 + 生成缩略图（长边 320，JPEG 0.72） */
-async function decodeImage(buffer) {
-  const blob = new Blob([buffer]);
+/** 解码图片（入参是 File/Blob）：取尺寸 + 生成缩略图（长边 320，JPEG 0.72）
+ *  不读整份 arrayBuffer —— createImageBitmap / <img> 都能直接吃 Blob。 */
+async function decodeImage(file) {
   try {
     if (window.createImageBitmap) {
-      const bmp = await createImageBitmap(blob);
+      const bmp = await createImageBitmap(file);
       const out = drawThumb(bmp, bmp.width, bmp.height);
+      const thumb = await canvasToBytes(out.canvas);
       bmp.close && bmp.close();
-      return { w: out.w, h: out.h, thumb: await canvasToBytes(out.canvas) };
+      return { w: out.w, h: out.h, thumb };
     }
   } catch { /* 退回 <img> 路径 */ }
-  const url = URL.createObjectURL(blob);
+  const url = URL.createObjectURL(file);
   try {
     const img = await loadImage(url);
     const out = drawThumb(img, img.naturalWidth, img.naturalHeight);
@@ -540,35 +665,4 @@ function canvasToBytes(canvas) {
       resolve(new Uint8Array(await blob.arrayBuffer()));
     }, "image/jpeg", 0.72);
   });
-}
-
-/** 解码视频：取尺寸 + 时长 + 首帧缩略图（失败时只丢封面，不影响导入） */
-async function decodeVideo(buffer, mime) {
-  const blob = new Blob([buffer], { type: mime || "video/mp4" });
-  const url = URL.createObjectURL(blob);
-  const video = document.createElement("video");
-  video.preload = "metadata";
-  video.muted = true;
-  video.playsInline = true;
-  video.src = url + "#t=0.1";
-  const meta = await new Promise((resolve) => {
-    const done = (v) => resolve(v);
-    video.onloadedmetadata = () => done({ w: video.videoWidth || 0, h: video.videoHeight || 0, dur: Number.isFinite(video.duration) ? video.duration : null });
-    video.onerror = () => done({ w: 0, h: 0, dur: null });
-    setTimeout(() => done({ w: video.videoWidth || 0, h: video.videoHeight || 0, dur: Number.isFinite(video.duration) ? video.duration : null }), 4000);
-  });
-  let thumb = null;
-  try {
-    video.currentTime = 0.1;
-    await new Promise((resolve) => {
-      video.onseeked = () => resolve();
-      setTimeout(resolve, 2500);
-    });
-    if (video.videoWidth && video.videoHeight) {
-      const { canvas } = drawThumb(video, video.videoWidth, video.videoHeight);
-      thumb = await canvasToBytes(canvas);
-    }
-  } catch { /* 无封面 */ }
-  URL.revokeObjectURL(url);
-  return { ...meta, thumb };
 }

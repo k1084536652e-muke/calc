@@ -7,7 +7,7 @@
  * - version.json 永远走网络（更新检查需要拿到线上版本），不进缓存。
  */
 
-const VERSION = "2.1.1";
+const VERSION = "2.1.2";
 const CACHE = "daishui-shell-" + VERSION;
 
 /** 本 App（2.1.x）外壳缓存前缀 */
@@ -28,10 +28,14 @@ const ASSETS = [
   "js/ui/doc-editor.js",
   "js/legacy-migrate.js",
   "js/core/calc.js",
+  "js/core/chunks.js",
+  "js/core/cover.js",
   "js/core/crypto.js",
   "js/core/db.js",
   "js/core/media.js",
   "js/core/repo.js",
+  "js/core/stream.js",
+  "js/core/stream-sw.js",
   "js/core/updater.js",
   /* 2.0.0 → 2.1.0 自动迁移模块（被 js/legacy-migrate.js 静态 import，运行期必然会加载） */
   "src/migrate-2.0/index.js",
@@ -75,6 +79,23 @@ async function isFirstUpgradeFromLegacy() {
   }
 }
 
+/**
+ * 流式媒体模块（js/core/stream-sw.js）——经典脚本，用 importScripts 加载。
+ *
+ * 为什么不是 module：本 SW 以经典脚本注册；规范禁止在经典 ServiceWorkerGlobalScope 用 `import()`，
+ * 而把注册改成 `{type:"module"}` 会导致已装 2.1.1 的存量用户升级失败（注册类型不可变更）。
+ * importScripts 的脚本会随 SW 一起被浏览器缓存，断网冷启动同样可用。
+ * 加载失败（文件缺失）→ 媒体请求 fail-closed 返回 503，绝不解密任何数据。
+ */
+try { importScripts("/js/core/stream-sw.js"); } catch (err) { /* 见 fetch 分支的 503 兜底 */ }
+
+/** 该路径是否是「加密媒体的虚拟 URL」——绝不进 app shell 缓存 */
+const MEDIA_PREFIX = "/__media/";
+
+function streamModule() {
+  return self.__dsStream || null;
+}
+
 self.addEventListener("install", (event) => {
   event.waitUntil((async () => {
     const takeover = await isFirstUpgradeFromLegacy();   /* 必须在 caches.open(CACHE) 之前判断 */
@@ -101,15 +122,53 @@ self.addEventListener("activate", (event) => {
 });
 
 self.addEventListener("message", (event) => {
-  if (event.data && event.data.type === "SKIP_WAITING") self.skipWaiting();
+  const data = event.data;
+  if (data && data.type === "SKIP_WAITING") { self.skipWaiting(); return; }
+  if (!data || typeof data.type !== "string" || !data.type.startsWith("dsm/")) return;
+
+  /* 流式媒体的授权消息（grant/allow/drop/revoke）：
+     key 只进内存；本 SW 重启后 Map 为空 → fail-closed（见 js/core/stream-sw.js）。
+     回复走 MessageChannel，页面等 ACK 后才把 URL 交给播放器。 */
+  const port = event.ports && event.ports[0];
+  const clientId = event.source && event.source.id ? event.source.id : "";
+  event.waitUntil((async () => {
+    let reply = { ok: false, reason: "UNAVAILABLE" };
+    try {
+      const mod = streamModule();
+      if (mod) reply = mod.onMessage(data, clientId) || reply;
+    } catch {
+      reply = { ok: false, reason: "MODULE" };
+    }
+    if (port) { try { port.postMessage(reply); } catch { /* 页面已关闭 */ } }
+  })());
 });
 
 self.addEventListener("fetch", (event) => {
   const req = event.request;
-  if (req.method !== "GET") return;
+  if (req.method !== "GET" && req.method !== "HEAD") return;
 
   const url = new URL(req.url);
   if (url.origin !== self.location.origin) return;          // 绝不接触跨域请求（应用本身无外部依赖）
+
+  /* 加密媒体的虚拟 URL：**必须**排在所有缓存分支之前。
+     它由 IndexedDB 里的密文按 Range 现场解密生成，既不能读缓存也不能写缓存
+     （一旦进了 app shell 缓存就等于把明文落盘）。 */
+  if (url.pathname.startsWith(MEDIA_PREFIX)) {
+    event.respondWith((async () => {
+      try {
+        const mod = streamModule();
+        if (!mod) throw new Error("stream module unavailable");
+        return await mod.handleFetch(req, { clientId: event.clientId || "" });
+      } catch {
+        return new Response("streaming unavailable", {
+          status: 503,
+          headers: { "Cache-Control": "no-store" },
+        });
+      }
+    })());
+    return;
+  }
+
   if (url.pathname.endsWith("/version.json")) return;        // 更新检查必须拿线上版本
 
   /* 页面导航：始终用**本 SW 自己那份**外壳缓存（App 只用已激活的版本）。
@@ -129,7 +188,7 @@ self.addEventListener("fetch", (event) => {
     caches.open(CACHE).then((cache) => cache.match(req, { ignoreSearch: true })).then((hit) => {
       if (hit) return hit;
       return fetch(req).then((res) => {
-        if (res && res.ok && res.type === "basic") {
+        if (res && res.ok && res.type === "basic" && res.status === 200 && !req.headers.has("range")) {
           const copy = res.clone();
           caches.open(CACHE).then((cache) => cache.put(req, copy)).catch(() => {});
         }

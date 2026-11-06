@@ -63,6 +63,16 @@ import { checkForUpdate, applyUpdate, registerSW } from "./core/updater.js";
 let vault = null;
 let media = null;
 
+/** 2.1.2：**新建**解锁码 / 紧急清除码统一要求 6–9 位数字。
+    旧版本（2.0.x / 2.1.x 早期）已存的 4–5 位码必须继续可解锁、可作为「当前解锁码」验证、
+    已存的旧清除码也必须继续可清除 —— 所以「校验已有码」仍用 core 的 PIN_RE（4–9 位，本层不改存储与核心规则），
+    只有「设置新码」才走 NEW_PIN_RE。 */
+const NEW_PIN_RE = /^\d{6,9}$/;
+/** 本 session 是否已经提示过「旧短码建议升级」（每 session 只提示一次） */
+let pinShortHinted = false;
+/** 当前解锁码是否为旧短码（4–5 位）：解锁成功后记录在内存里，供设置页提示，不落盘、不进日志 */
+let pinIsShort = false;
+
 /** 假照片生成器（原型 rng/palettes/photo）已删除：缩略图改为解密后的真实 Blob objectURL，
     见 bgFor() / media.paintThumbs()。 */
 
@@ -210,18 +220,41 @@ function openAlbum(){
   showView();
   render();
 }
+/* 2.1.2 隐私遮罩：iOS 主屏应用切后台、Android 最近任务、来电 / 控制中心都会由系统「拍照」当快照，
+   而快照可能早于 visibilitychange 的异步收尾。这里在事件回调里**同步**把相册换成计算器外观
+   （只切两个 hidden，不动任何样式 / 动画 / DOM 结构），保证快照里是伪装层、拍不到照片。
+   遮罩 ≠ 锁定：只有 visibilityState 变 hidden / pagehide 才继续走原有的自动锁（清密钥 + 清 objectURL）；
+   临时失焦（系统输入弹窗、文件选择器、通知中心）只遮不锁，回到前台（focus / visible）原样还原。 */
+let privacyCovered=false;
+function privacyCover(){
+  if(privacyCovered||S.view!=="album") return;
+  privacyCovered=true;
+  document.getElementById("v-album").hidden=true;
+  document.getElementById("v-calc").hidden=false;
+}
+function privacyUncover(){
+  if(!privacyCovered) return;
+  privacyCovered=false;
+  if(S.view!=="album") return;   /* 已经锁上了（lock() → showView()），按锁定的算 */
+  document.getElementById("v-album").hidden=false;
+  document.getElementById("v-calc").hidden=true;
+}
+
 /** 锁定回计算器：清空内存密钥与全部 objectURL（§2 / §23） */
 function lock(){
   endPicker();
+  privacyCovered=false;
   if(S.doc&&docEditor) saveDocBeforeLeave();
   S.view="calc"; S.plus=false; S.plusResume=false; S.select=false; S.sel=new Set(); S.search=false; S.folder=null; S.sub=null; S.doc=null;
   S.q=""; S.filter="all"; S.limit=20; render._sig=null; refreshBody._sig=null;
   media.clear();
+  /* 2.1.2：懒补没有「一次性闸门」了 —— 每次解锁都会继续处理剩下缺封面的视频（见 lazyBackfillCovers） */
   vault.lock();
   showView();
 }
 function showView(){
   applyCurrentTheme(); /* 同一帧内先切主题再切视图，避免闪烁 */
+  privacyCovered=false;
   document.getElementById("v-calc").hidden = S.view!=="calc";
   document.getElementById("v-album").hidden = S.view!=="album";
   document.getElementById("layer").innerHTML="";
@@ -494,11 +527,11 @@ function settingsBody(){
         <div class="gh">解锁码</div>
         <div class="group">
           <label class="row frow" id="fr-cur"><span class="lab">当前解锁码</span><input id="pin-cur" type="password" inputmode="numeric" pattern="[0-9]*" autocomplete="off" placeholder="请输入" maxlength="9"></label>
-          <label class="row frow" id="fr-new"><span class="lab">新解锁码</span><input id="pin-new" type="password" inputmode="numeric" pattern="[0-9]*" autocomplete="off" placeholder="4–9 位数字" maxlength="9"></label>
+          <label class="row frow" id="fr-new"><span class="lab">新解锁码</span><input id="pin-new" type="password" inputmode="numeric" pattern="[0-9]*" autocomplete="off" placeholder="6–9 位数字" maxlength="9"></label>
           <label class="row frow" id="fr-cf"><span class="lab">确认新解锁码</span><input id="pin-cf" type="password" inputmode="numeric" pattern="[0-9]*" autocomplete="off" placeholder="再次输入" maxlength="9"></label>
         </div>
         <div class="ferr" id="pin-err" hidden></div>
-        <p class="gf">解锁码为 4–9 位数字（与贷款金额整数位上限一致）。在首页贷款金额中输入并点击计算即可进入。</p>
+        <p class="gf">解锁码为 6–9 位数字（与贷款金额整数位上限一致）。在首页贷款金额中输入并点击计算即可进入。</p>
         <button type="button" class="cta" data-act="save-pin">保存</button>
       </div>`;
   } else if(S.sub==="retention"){
@@ -525,7 +558,7 @@ function settingsBody(){
         <div class="infocard">配置后，在首页输入此码并点击计算，将清除本机所有内容，且无法恢复。须与解锁码不同。</div>
         <div class="gh">设置清除码</div>
         <div class="group">
-          <label class="row frow" id="fr-wipe"><span class="lab">清除码</span><input id="wipe-code" type="password" inputmode="numeric" pattern="[0-9]*" autocomplete="off" placeholder="4–9 位数字" maxlength="9"></label>
+          <label class="row frow" id="fr-wipe"><span class="lab">清除码</span><input id="wipe-code" type="password" inputmode="numeric" pattern="[0-9]*" autocomplete="off" placeholder="6–9 位数字" maxlength="9"></label>
           <label class="row frow" id="fr-wipe2"><span class="lab">确认清除码</span><input id="wipe-code2" type="password" inputmode="numeric" pattern="[0-9]*" autocomplete="off" placeholder="再次输入" maxlength="9"></label>
         </div>
         <div class="ferr" id="wipe-err" hidden></div>
@@ -1047,6 +1080,7 @@ function startPicker(){
 function endPicker(){
   if(!S.picking) return;
   S.picking=false; PICK.off&&PICK.off(); PICK.off=null;
+  privacyUncover();   /* 2.1.2：文件选取器关闭后立刻还原相册（blur 只遮不锁，别让遮罩留在屏幕上） */
   if(S.plus) return;   /* 菜单仍展开：+ 继续保持 × */
   const fab=document.querySelector("#a-bar .fab"); fab&&fab.classList.remove("open");
   const t=document.querySelector('#a-bar [data-act="plus"]'); t&&t.setAttribute("aria-expanded","false");
@@ -1391,16 +1425,22 @@ function bindAlbum(){
       toast("已保存"); render(); return;
     }
     if(act==="doc-aa"){ S.doc.sheet=!S.doc.sheet; render(); return; }
-    if(act==="open-pin"){ S.sub="pin"; render(); return; }
+    if(act==="open-pin"){
+      S.sub="pin"; render();
+      /* 2.1.2：当前仍是旧短码（4–5 位）时，在修改页用 toast 温和提示升级到 6–9 位（不加 DOM、不改布局） */
+      if(pinIsShort) toast("当前解锁码为旧短码（4–5 位），建议改为 6–9 位");
+      return;
+    }
     if(act==="save-pin"){
       const cur=(document.getElementById("pin-cur")||{}).value||"";
       const nw=(document.getElementById("pin-new")||{}).value||"";
       const cf=(document.getElementById("pin-cf")||{}).value||"";
       const showErr=(msg,row)=>{ const er=document.getElementById("pin-err"); if(er){ er.textContent=msg; er.hidden=false; } ["fr-cur","fr-new","fr-cf"].forEach(id=>{ const el=document.getElementById(id); el&&el.classList.toggle("err",id===row); }); };
       if(!PIN_RE.test(cur)){ showErr("请输入当前解锁码","fr-cur"); return; }
-      if(!PIN_RE.test(nw)){ showErr("新解锁码须为 4–9 位数字","fr-new"); return; }
+      if(!NEW_PIN_RE.test(nw)){ showErr("新解锁码须为 6–9 位数字","fr-new"); return; }
       if(nw!==cf){ showErr("两次输入不一致","fr-cf"); return; }
       vault.changePin(cur,nw).then(()=>{
+        pinIsShort=false; pinShortHinted=false;   /* 已是 6–9 位新码，短码提示不再需要 */
         S.sub=null; render(); toast("解锁码已修改");
       }).catch(err=>{
         showErr(err.message==="解锁码不正确"?"解锁码不正确":"修改失败，请重试","fr-cur");
@@ -1439,7 +1479,7 @@ function bindAlbum(){
       const c1=(document.getElementById("wipe-code")||{}).value||"";
       const c2=(document.getElementById("wipe-code2")||{}).value||"";
       const showErr=(msg,row)=>{ const er=document.getElementById("wipe-err"); if(er){ er.textContent=msg; er.hidden=false; } ["fr-wipe","fr-wipe2"].forEach(id=>{ const el=document.getElementById(id); el&&el.classList.toggle("err",id===row); }); };
-      if(!PIN_RE.test(c1)){ showErr("请输入 4–9 位数字","fr-wipe"); return; }
+      if(!NEW_PIN_RE.test(c1)){ showErr("请输入 6–9 位数字","fr-wipe"); return; }
       if(c1!==c2){ showErr("两次输入不一致","fr-wipe2"); return; }
       verifyUnlockPin(async ()=>{
         try{
@@ -1794,7 +1834,11 @@ async function exportSelected(ids){
     const it=list[i];
     pg.set({index:i+1,name:it.name,pct:(i/list.length)*100});
     try{
-      const bytes=await vault.readBlob(it.id);
+      /* 2.1.2：分块条目的 readBlob 会抛 CHUNKED（播放护栏不变），导出走专用的整份读取接口，
+         得到的字节与源文件逐字节一致（含 EXIF），下载仍是原单个文件，不打包、不加进度条新状态。
+         已知限制：大视频导出要整份缓冲，内存方案已延期，不在这里假装解决。 */
+      const bytes = vault.readForExport ? await vault.readForExport(it.id) : await vault.readBlob(it.id);
+
       if(!bytes) throw new Error("读取失败");
       const blob=new Blob([bytes],{type:(it.ref&&it.ref.mime)||"application/octet-stream"});
       const url=URL.createObjectURL(blob);
@@ -1824,7 +1868,13 @@ async function importFilesReal(files){
     });
     hydrate(); render._sig=null; render();
     if(cancelled) return;
-    if(failed.length) pg.fail(`${failed.length} 项未能导入：${failed[0].name}`);
+    if(failed.length){
+      /* §44：失败不静默 —— 明确「成功 N / 失败 M」，并列出前几个文件名（适量显示，完整明细进控制台） */
+      const names=failed.slice(0,3).map(f=>f.name).join("、");
+      const more=failed.length>3?` 等 ${failed.length} 项`:"";
+      pg.fail(`成功 ${imported.length} / 失败 ${failed.length}：${names}${more}`);
+      console.warn("导入失败明细", failed.map(f=>({name:f.name,code:f.code,message:String((f.error&&f.error.message)||f.error)})));
+    }
     else pg.done({title:"导入完成", text:`已导入 ${imported.length} 项`});
   }catch(err){
     pg.fail(quotaError(err)?"本机存储空间不足，未能导入":(err&&err.message)||"导入失败");
@@ -1868,7 +1918,12 @@ function hydrateSlots(v){
   });
   v.querySelectorAll("video[data-vid]").forEach(el=>{
     const id=el.dataset.vid;
-    media.ensure("video",id).then(u=>{ if(u&&el.isConnected){ el.src=u+"#t=0.1"; vFirstFrame(el); } });
+    media.ensure("video",id).then(u=>{
+      if(u&&el.isConnected){ el.src=u+"#t=0.1"; vFirstFrame(el); }
+      /* 2.1.2：用户打开了这条视频（media 里已有解密 URL）→ 继续补剩下没封面的视频，
+         大 legacy 文件正是靠这条路在不额外解密的前提下拿到封面 */
+      if(u){ const it=findItem(id); if(it&&it.video&&!it.hasThumb) lazyBackfillCovers(); }
+    });
   });
 }
 /* R10-08：未播放时显示视频第一帧——src 带媒体片段 #t=0.1（iOS Safari 只 preload=metadata 时常不解码画面，
@@ -1878,7 +1933,7 @@ function vFirstFrame(video){
   if(video.readyState>=1) seek(); else video.addEventListener("loadedmetadata",seek,{once:true});
 }
 /* 视频槽位挂 Plyr：控件集 / 速度菜单 / i18n / chrome-hidden / 双击 ±10 秒全部沿用原 openVideo，只是把作用域收到当前槽位 */
-function mountPlyr(host, video, stage){
+function mountPlyr(host, video, stage, onAdjacent){
   const player=new Plyr(video,{
     controls:["play-large","rewind","play","fast-forward","progress","current-time","duration","mute","volume","settings","fullscreen"],
     settings:["speed"], speed:{selected:1,options:[0.5,0.75,1,1.25,1.5,2]}, seekTime:10,
@@ -1887,6 +1942,18 @@ function mountPlyr(host, video, stage){
     tooltips:{controls:false,seek:true}, keyboard:{focused:true,global:false},
     iconUrl:"vendor/plyr/plyr.svg", blankVideo:"vendor/plyr/blank.mp4", i18n:PLYR_I18N
   });
+  /* 2.1.2（用户 pt225 第 4 项 + pt226 已同意）：这两个位置的按钮改成「上一项 / 下一项」相邻媒体。
+     外观零改动：仍是定稿里的双箭头图标与位置，只是把 Plyr 默认的 ±seekTime 换成翻页；
+     双击 ±10 秒保留在下方 pointerup 里。到第一/最后一项时按钮不隐藏，点了没反应（与横滑到头一致）。 */
+  if(typeof onAdjacent==="function"){
+    host.querySelectorAll(".plyr__control[data-plyr='rewind'], .plyr__control[data-plyr='fast-forward']").forEach(btn=>{
+      const dir=btn.dataset.plyr==="rewind"?-1:1;
+      btn.setAttribute("aria-label", dir<0?"上一项":"下一项");
+      btn.setAttribute("title", dir<0?"上一项":"下一项");
+      /* 捕获阶段拦掉 Plyr 自己的 seek 处理，再走查看器的同一条过渡 */
+      btn.addEventListener("click", ev=>{ ev.preventDefault(); ev.stopPropagation(); onAdjacent(dir); }, true);
+    });
+  }
   player.on("controlshidden",()=>host.classList.add("chrome-hidden"));
   player.on("controlsshown",()=>host.classList.remove("chrome-hidden"));
   /* 双击 / 双指点左右三分之一：−10 / +10 秒（中间保留 Plyr 的双击全屏） */
@@ -2048,7 +2115,7 @@ function openViewer(id, opts){
     if(video){ video.muted=false; video.removeAttribute("muted"); }
     /* R10-05：幻灯片模式的视频只做自动播放——不挂 Plyr（Plyr 控件层会抢走「点屏幕切换控制条」的单击），也不出原生控件 */
     if(SS){ if(video) video.removeAttribute("controls"); }
-    else if(video&&window.Plyr){ player=mountPlyr(v,video,slot.querySelector(".vstage")); v._player=player; }
+    else if(video&&window.Plyr){ player=mountPlyr(v,video,slot.querySelector(".vstage"), d=>{ pager.go(d); }); v._player=player; }
     else if(video) video.controls=true;   /* 无 Plyr 时退回原生控件 */
     syncBar();
     hydrateSlots(v);
@@ -2379,7 +2446,28 @@ async function afterUnlock(){
     if(purged) console.info("已清理到期回收站项目", purged);
   }catch(err){ console.warn("回收站清理失败", err); }
   openAlbum();
+  lazyBackfillCovers();   /* 2.1.2：旧视频没有封面 → 用流式 URL 后台懒补，不重导入、不动原件 */
   checkUpdate(false);
+}
+/* 2.1.2：已导入但没有封面的视频，懒补首帧 → 加密写入 thumbs。
+   分块条目走 SW 流式 URL（不整份解密）；legacy 单 blob 只有小文件才顺序读一次，
+   大文件只在用户自己打开播放、media 里已有解密 URL 时才复用。不重导入、不改动其它字段、失败静默跳过。
+   **不设一次性闸门**：每次解锁、以及用户打开某个缺封面视频时都会继续处理剩下的条目
+   （每次仍限 6 个，避免一次跑完耗电/占用主线程）。 */
+let coverBackfillBusy=false;
+async function lazyBackfillCovers(){
+  if(coverBackfillBusy) return;
+  coverBackfillBusy=true;
+  try{
+    const Cover=await import("./core/cover.js");
+    const res=await Cover.backfillVideoCovers(vault,{limit:6, media});
+    if(res&&res.fixed){
+      hydrate(); render._sig=null;
+      /* 查看器打开时不要重渲染底下的网格（会打断正在看的条目）；数据已 hydrate，下次渲染自然带封面 */
+      if(!document.querySelector("#layer .viewer")) render();
+    }
+  }catch(err){ console.warn("封面懒补跳过", err); }
+  finally{ coverBackfillBusy=false; }
 }
 /** 紧急清除码：立即清空本机全部内容（含解锁码），回到首次使用状态 */
 async function emergencyWipe(){
@@ -2408,7 +2496,13 @@ async function handleSecretCode(raw){
   }
   let ok=false;
   try{ ok=await vault.unlock(raw); }catch(err){ console.error("解锁失败", err); }
-  if(ok){ await resumeLegacyMigration(raw); afterUnlock(); return; }
+  if(ok){
+    notePinLength(raw);            /* 2.1.2：旧短码仍可解锁，只记一次「建议升级」的线索 */
+    await resumeLegacyMigration(raw);
+    await afterUnlock();     /* 等 openAlbum() 清完 #layer 再提示，否则 toast 会被新一轮渲染抹掉 */
+    suggestLongerPin();
+    return;
+  }
   runMortgageCalc();   /* 不是解锁码：按普通贷款金额继续算 */
 }
 
@@ -2453,13 +2547,27 @@ async function resumeLegacyMigration(pin){
   }catch(err){ console.warn("续做迁移失败", err); }
   finally{ migrating=false; }
 }
+/** 2.1.2：记录当前解锁码是不是旧短码（4–5 位）。只在内存里，不落盘、不写日志、不进 DOM。 */
+function notePinLength(raw){ pinIsShort=String(raw||"").length<6; }
+/** 2.1.2：旧短码解锁成功时，每 session 一次温和建议（沿用 toast，不新增界面元素）。
+    只是建议，不阻断、不强制改码；密码校验与自动锁语义完全不变。 */
+function suggestLongerPin(){
+  if(!pinIsShort||pinShortHinted) return;
+  pinShortHinted=true;
+  toast("解锁码为旧短码，建议在设置 › 解锁码中改为 6–9 位");
+}
+
 /** 首次使用：把输入的数字设为解锁码（一次性确认，避免误把真实贷款金额当成码） */
 function askSetPin(pin){
+  /* 2.1.2：首次设置只接受 6–9 位 —— 4–5 位的输入照常当贷款金额计算，不弹「首次使用」，
+     避免用户把 4 位金额误设成解锁码。旧版本已存的短码不受影响（走 unlock 路径，见上）。 */
+  if(!NEW_PIN_RE.test(String(pin))){ runMortgageCalc(); return; }
   dialog({title:"首次使用", text:`将 ${pin} 设为解锁码？之后在「贷款金额」中输入它并点击「计算」即可打开私密空间。`, ok:"设为解锁码", onCancel:()=>runMortgageCalc(), onOk:async ()=>{
     try{
       await vault.create(pin);
       vaultConfigured=true;
       S.wipeOn=false;
+      pinIsShort=false;
       await afterUnlock();
     }catch(err){ return err.message||"设置失败"; }
   }});
@@ -2478,10 +2586,22 @@ export async function initUI({ vault: v, media: m }){
   wireCalc();
   showView();
   registerSW();
-  /* 进入后台立即锁定并清空密钥与 objectURL（§2）。系统文件选取器 / 导入过程中不打断。 */
+  /* 进入后台立即锁定并清空密钥与 objectURL（§2）。系统文件选取器 / 导入过程中不打断。
+     2.1.2：任何「要离开前台」的信号都先同步盖上计算器遮罩（见 privacyCover），再决定锁不锁。 */
   document.addEventListener("visibilitychange",()=>{
-    if(document.visibilityState!=="hidden") { checkUpdate(false); return; }
+    if(document.visibilityState!=="hidden"){ privacyUncover(); checkUpdate(false); return; }
+    privacyCover();
     if(S.view!=="album"||S.picking||importing||migrating) return;
     lock();
   });
+  /* pagehide：页面即将离开（关闭 / 刷新 / 进 bfcache）。同样先遮后锁，语义与切后台一致。 */
+  window.addEventListener("pagehide",()=>{
+    privacyCover();
+    if(S.view!=="album"||S.picking||importing||migrating) return;
+    lock();
+  });
+  /* blur / focus：只遮不锁 —— 系统文件选择器、输入弹窗、控制中心这类临时失焦不该把相册锁掉；
+     回到前台时如果没锁就原样还原。dialog 是页内弹层，不会触发 window blur，互不影响。 */
+  window.addEventListener("blur",()=>{ privacyCover(); });
+  window.addEventListener("focus",()=>{ privacyUncover(); });
 }

@@ -24,12 +24,30 @@ const AAD = {
   blob: (id) => `daishui/blob/${id}`,
   doc: (id) => `daishui/doc/${id}`,
   prefs: "daishui/prefs/v1",
+  // 分块：AAD 绑定 itemId + 块序号 + 总块数，重排/截断/跨文件搬运都会导致解密失败
+  chunk: (id, index, total) => `daishui/chunk/${id}/${index}/${total}`,
+  // 分块清单里的类型信息（kind/mime）单独加密，避免 chunkmeta 出现明文文件类型
+  chunkMeta: (id) => `daishui/chunkmeta/${id}`,
 };
 
 export function aadFor(kind, id) {
   const f = AAD[kind];
   if (!f) throw new Error("未知的 AAD 类型");
   return typeof f === "function" ? f(id) : f;
+}
+
+/** 分块 AAD（显式签名，避免把 index/total 当成 id 传错） */
+export function aadChunk(itemId, index, total) {
+  if (!itemId) throw new Error("缺少 itemId");
+  if (!Number.isInteger(index) || index < 0) throw new Error("块序号非法");
+  if (!Number.isInteger(total) || total <= 0 || index >= total) throw new Error("块总数非法");
+  return AAD.chunk(String(itemId), index, total);
+}
+
+/** 分块清单加密元数据的 AAD（与 chunk 的 AAD 分开，不能互换） */
+export function aadChunkMeta(itemId) {
+  if (!itemId) throw new Error("缺少 itemId");
+  return AAD.chunkMeta(String(itemId));
 }
 
 const enc = new TextEncoder();
