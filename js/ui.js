@@ -2147,65 +2147,27 @@ function viewerItems(id){
 /* R10-05：幻灯片播放列表 = 文件夹详情当前列表同口径（关键词 / 筛选项，与 viewerItems 一致），去掉文档；从第一项开始 */
 function slideshowIds(){ return folderItems().filter(it=>matchQ(it.name)&&matchF(it)).filter(it=>!it.doc).map(it=>it.id); }
 /* 槽位里的 muted 只给「封面用」的相邻槽位（相邻项不挂 Plyr）；当前槽位由 renderSlots() 在挂 Plyr 前摘掉，见下 */
-/** 把 objectURL 先解码进位图缓存，再赋给 DOM，避免 iOS 新节点首帧黑闪 */
-function decodeUrl(url){
-  return new Promise((resolve)=>{
-    if(!url){ resolve(false); return; }
-    const img=new Image();
-    img.onload=()=>{
-      const fin=()=>resolve(true);
-      if(typeof img.decode==="function") img.decode().then(fin,fin);
-      else fin();
-    };
-    img.onerror=()=>resolve(false);
-    img.src=url;
-  });
-}
 function slotHTML(it){
   if(!it) return `<div class="vslot"></div>`;
   if(it.video) return `<div class="vslot" data-slot="${it.id}"><div class="vstage"><video playsinline webkit-playsinline muted preload="metadata" data-vid="${it.id}"></video>
       <div class="vseek l">−10 秒</div><div class="vseek r">+10 秒</div></div></div>`;
-  /* 缩略图立刻占位；原图若已在缓存则叠在上层（仍会先 decode 再只留原图） */
-  const thumb=media.url("thumb",it.id);
-  const orig=media.url("orig",it.id);
-  let bg="none";
-  if(orig&&thumb) bg=`url("${orig}"), url("${thumb}")`;
-  else if(orig) bg=`url("${orig}")`;
-  else if(thumb) bg=`url("${thumb}")`;
-  return `<div class="vslot" data-slot="${it.id}"><div class="img" data-full="${it.id}" style="background-image:${bg}"></div></div>`;
-}
-/** 给照片槽贴原图：先 thumb 占位 → ensure+decode → 再换成原图（不在 decode 前清掉可见图） */
-function hydratePhotoEl(el, id, keep){
-  if(!el||!id) return;
-  const thumb=media.url("thumb",id);
-  if(thumb && (!el.style.backgroundImage || el.style.backgroundImage==="none")){
-    el.style.backgroundImage=`url("${thumb}")`;
-  }
-  const applyOrig=(u)=>{
-    if(!(u&&el.isConnected)) return;
-    decodeUrl(u).then((ok)=>{
-      if(!ok||!el.isConnected) return;
-      el.style.backgroundImage=`url("${u}")`;
-      if(keep) keep.add(id);
-    });
-  };
-  const cached=media.url("orig",id);
-  if(cached) applyOrig(cached);
-  media.ensure("orig",id).then(applyOrig);
-  if(thumb) media.ensure("thumb",id); /* 触碰 LRU */
+  /* 照片背景来自解密后的 Blob objectURL（原图优先，未就绪先用缩略图占位） */
+  const u=media.url("orig",it.id)||media.url("thumb",it.id);
+  return `<div class="vslot" data-slot="${it.id}"><div class="img" data-full="${it.id}" style="background-image:${u?`url("${u}")`:"none"}"></div></div>`;
 }
 /** 槽位渲染后异步补上原图 / 视频源（#t=0.1 用于 iOS 出第一帧，§68） */
-function hydrateSlots(root, keep){
-  root.querySelectorAll("[data-full]").forEach(el=>hydratePhotoEl(el, el.dataset.full, keep));
-  root.querySelectorAll("video[data-vid]").forEach(el=>{
+function hydrateSlots(v){
+  v.querySelectorAll("[data-full]").forEach(el=>{
+    const id=el.dataset.full;
+    media.ensure("orig",id).then(u=>{ if(u&&el.isConnected) el.style.backgroundImage=`url("${u}")`; });
+  });
+  v.querySelectorAll("video[data-vid]").forEach(el=>{
     const id=el.dataset.vid;
-    if(el.dataset.hydratedSrc) return;   /* 回收槽位时别重复挂 src 打断当前帧 */
     const apply=(u)=>{
       if(!(u&&el.isConnected)) return;
-      if(el.dataset.hydratedSrc===u) return;
-      el.dataset.hydratedSrc=u;
       el.src=u+"#t=0.1";
       vFirstFrame(el);
+      /* SW 被系统杀后旧 token 会 403：失败时重新授权并换新 URL，保留当前进度 */
       if(el.dataset.streamRetryBound) return;
       el.dataset.streamRetryBound="1";
       el.addEventListener("error",()=>{
@@ -2213,10 +2175,8 @@ function hydrateSlots(root, keep){
         el.dataset.streamRetried="1";
         const t=el.currentTime||0;
         media.release("video",id);
-        delete el.dataset.hydratedSrc;
         Stream.restore().catch(()=>{}).then(()=>media.ensure("video",id)).then(u2=>{
           if(!(u2&&el.isConnected)) return;
-          el.dataset.hydratedSrc=u2;
           el.src=u2;
           const resume=()=>{ try{ if(t>0.2) el.currentTime=t; }catch(_){} };
           if(el.readyState>=1) resume(); else el.addEventListener("loadedmetadata",resume,{once:true});
@@ -2226,6 +2186,8 @@ function hydrateSlots(root, keep){
     };
     media.ensure("video",id).then(u=>{
       apply(u);
+      /* 2.1.2：用户打开了这条视频（media 里已有解密 URL）→ 继续补剩下没封面的视频，
+         大 legacy 文件正是靠这条路在不额外解密的前提下拿到封面 */
       if(u){ const it=findItem(id); if(it&&it.video&&!it.hasThumb) lazyBackfillCovers(); }
     });
   });
@@ -2406,81 +2368,31 @@ function openViewer(id, opts){
   /* R10-10：双击放大到约 2.5 倍（以点击点为中心）；放大状态下双击回到适配大小并恢复顶栏 */
   function doubleTap(x,y){ if(Z.s>1.001) zoomTo(1,null,null,true); else zoomTo(2.5,x,y,true); }
   function syncBar(){ const it=cur(); bar.querySelector("b").textContent=it?it.name:""; }
-  /* 查看器会话内已 ensure 的原图 id；超出 ±2 的释放，控制内存 */
-  const origKeep=new Set();
-  function preloadAround(center){
-    for(let j=center-2;j<=center+2;j++){
-      if(j<0||j>=items.length) continue;
-      const it=findItem(items[j]); if(!it||it.doc) continue;
-      if(it.video){
-        /* 邻页视频只预取流式 URL / 元数据，不 play */
-        media.ensure("video",it.id).then(()=>{});
-        continue;
-      }
-      media.ensure("thumb",it.id).then(()=>{});
-      media.ensure("orig",it.id).then(u=>{ if(u){ origKeep.add(it.id); decodeUrl(u); } });
-    }
-    /* 释放远离当前页的原图 blob URL（缩略图走全局 LRU，不在这里动） */
-    for(const id of [...origKeep]){
-      let near=false;
-      for(let j=center-2;j<=center+2;j++){ if(j>=0&&j<items.length&&items[j]===id){ near=true; break; } }
-      if(!near){ media.release("orig",id); origKeep.delete(id); }
-    }
-  }
-  function mountCurrentMedia(){
+  /* 重排三槽位：先销毁 Plyr、重建槽位（预渲染新的相邻项，切换后不闪），再只给「当前」槽位挂 Plyr */
+  function renderSlots(){
+    track.querySelectorAll("video").forEach(x=>{ try{ x.pause(); }catch(_){} });
+    if(player){ try{ player.destroy(); }catch(_){} player=null; v._player=null; }
+    track.innerHTML=slotHTML(findItem(items[idx-1]||""))+slotHTML(cur())+slotHTML(findItem(items[idx+1]||""));
+    track.querySelectorAll("video").forEach(vFirstFrame);   /* 相邻槽位也出第一帧，滑到视频时不黑屏 */
+    place(0,false);
     v.classList.toggle("vplayer",!!(cur()&&cur().video));
     v.classList.remove("chrome-hidden");
     const slot=track.children[1], video=slot?slot.querySelector("video"):null;
+    /* R10-08 修正：两侧槽位的 muted 只服务于封面预载（相邻项不挂 Plyr）；「当前」槽位是用户真正播放的那一支，
+       必须在这里先取消静音——Plyr 构造时会把 media 的 muted 属性读成 config.muted=true，控件随即显示静音图标、
+       点播放没声音。去属性 + muted=false 后与改前 openVideo 一致：默认有声音、音量图标为非静音。翻页时同一路径生效。 */
     if(video){ video.muted=false; video.removeAttribute("muted"); }
+    /* R10-05：幻灯片模式的视频只做自动播放——不挂 Plyr（Plyr 控件层会抢走「点屏幕切换控制条」的单击），也不出原生控件 */
     if(SS){ if(video) video.removeAttribute("controls"); }
     else if(video&&window.Plyr){ player=mountPlyr(v,video,slot.querySelector(".vstage"), d=>{ pager.go(d); }); v._player=player; }
-    else if(video) video.controls=true;
+    else if(video) video.controls=true;   /* 无 Plyr 时退回原生控件 */
     syncBar();
+    hydrateSlots(v);
   }
-  function pauseAllVideos(){
-    track.querySelectorAll("video").forEach(x=>{ try{ x.pause(); }catch(_){} });
-    if(player){ try{ player.destroy(); }catch(_){} player=null; v._player=null; }
-  }
-  /* 首开 / 无法回收时：整轨重建三槽位 */
-  function renderSlots(){
-    pauseAllVideos();
-    track.innerHTML=slotHTML(findItem(items[idx-1]||""))+slotHTML(cur())+slotHTML(findItem(items[idx+1]||""));
-    track.querySelectorAll("video").forEach(vFirstFrame);
-    place(0,false);
-    mountCurrentMedia();
-    hydrateSlots(v, origKeep);
-    preloadAround(idx);
-  }
-  /**
-   * 翻页后回收槽位：可见那一页的 DOM 节点原样留下（已解码的图不会因 innerHTML 重建而黑闪），
-   * 只丢掉滑出的那一页，并在另一端补上新的邻居。
-   * dir>0：向左滑看下一张；dir<0：向右滑看上一张。
-   */
-  function recycleSlots(dir){
-    pauseAllVideos();
+  function onChangePage(){
     resetZoom();
-    [...track.children].forEach(s=>{ s.style.transition="none"; s.style.transform=""; s.style.opacity=""; });
-    if(dir>0){
-      if(track.children[0]) track.children[0].remove();
-      track.insertAdjacentHTML("beforeend", slotHTML(findItem(items[idx+1]||"")));
-      const edge=track.children[2];
-      if(edge){ hydrateSlots(edge, origKeep); edge.querySelectorAll("video").forEach(vFirstFrame); }
-    }else if(dir<0){
-      if(track.lastElementChild) track.lastElementChild.remove();
-      track.insertAdjacentHTML("afterbegin", slotHTML(findItem(items[idx-1]||"")));
-      const edge=track.children[0];
-      if(edge){ hydrateSlots(edge, origKeep); edge.querySelectorAll("video").forEach(vFirstFrame); }
-    }
-    place(0,false);
-    mountCurrentMedia();
-    /* 当前槽若是视频，确保 src 已挂（邻页预载时可能已 hydrated） */
-    hydrateSlots(track.children[1]||v, origKeep);
-    preloadAround(idx);
-  }
-  function onChangePage(dir){
-    if(dir) recycleSlots(dir);
-    else { resetZoom(); renderSlots(); }
-    if(SS) ssArm();
+    renderSlots();
+    if(SS) ssArm();   /* R10-05：翻页（含手动滑）后按当前项重新计时 / 自动播放 */
     if(typeof pager.onChange==="function") pager.onChange(idx,cur());
   }
   /* R10-05/09：幻灯片推进——照片停「幻灯片间隔」秒后 go(1)；视频自动播放，播完（ended）再 go(1)，不受间隔限制；
@@ -2517,7 +2429,7 @@ function openViewer(id, opts){
     clearTimeout(slideTimer); slideTimer=0;
     const d=slideDir, res=slideResolve; slideDir=0; slideResolve=null;
     idx+=d>0?1:-1;
-    onChangePage(d);
+    onChangePage();
     if(res) res(true);
     return true;
   }
@@ -2527,7 +2439,7 @@ function openViewer(id, opts){
     const step=W()+PAGER_GAP;
     track.style.transition=!noMotion()?PAGER_T:"none";
     track.style.transform="translate3d("+(-step-dir*step)+"px,0,0)";
-    const done=()=>{ idx+=dir>0?1:-1; onChangePage(dir); return true; };
+    const done=()=>{ idx+=dir>0?1:-1; onChangePage(); return true; };
     if(noMotion()) return Promise.resolve(done());
     slideDir=dir;
     return new Promise(res=>{
