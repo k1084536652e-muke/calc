@@ -14,6 +14,8 @@
 import * as Stream from "./stream.js";
 
 const THUMB_LIMIT = 240;
+/** 流式 URL 不可用时，小于此大小的分块条目可退回整份解密成 blob URL（有界内存；大文件绝不走这条） */
+const STREAM_BLOB_FALLBACK_MAX = 80 * 1024 * 1024;
 
 export class MediaCache {
   constructor(vault) {
@@ -80,13 +82,23 @@ export class MediaCache {
           if (chunked) {
             const url = await Stream.urlFor(id);
             // 授权在途中被撤销（锁屏/切后台）→ 这个 URL 已经是旧 token，绝不能缓存/回显
-            if (!url || ep !== this.epoch) return null;
-            this.urls.set(key, url);
-            this.streams.add(key);
-            this.#touch(kind, id);
-            return url;
+            if (url && ep === this.epoch) {
+              this.urls.set(key, url);
+              this.streams.add(key);
+              this.#touch(kind, id);
+              return url;
+            }
+            if (ep !== this.epoch) return null;
+            // SW 流式不可用时：仅对小文件退回整份解密（大文件继续 fail-closed，避免 OOM）
+            const item = this.vault.items.find((x) => x.id === id);
+            const size = Number(item && item.size) || 0;
+            if (!size || size > STREAM_BLOB_FALLBACK_MAX || typeof this.vault.readForExport !== "function") {
+              return null;
+            }
+            bytes = await this.vault.readForExport(id);
+          } else {
+            bytes = await this.vault.readBlob(id);
           }
-          bytes = await this.vault.readBlob(id);
         }
         if (!bytes) return null;
         const item = this.vault.items.find((x) => x.id === id);

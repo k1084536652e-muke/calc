@@ -37,6 +37,22 @@ export const NEW_PIN_RE = /^\d{6,9}$/;
 const now = () => Date.now();
 const newId = (prefix = "") => prefix + Array.from(randomBytes(8), (b) => b.toString(16).padStart(2, "0")).join("");
 
+/** iOS 选片器有时给出空 type / application/octet-stream；按扩展名补全，避免被当成普通文件、Content-Type 不对导致无法播放 */
+const EXT_MIME = {
+  jpg: "image/jpeg", jpeg: "image/jpeg", png: "image/png", gif: "image/gif",
+  webp: "image/webp", heic: "image/heic", heif: "image/heif",
+  mp4: "video/mp4", m4v: "video/mp4", mov: "video/quicktime", qt: "video/quicktime",
+  webm: "video/webm", mkv: "video/x-matroska", "3gp": "video/3gpp", "3g2": "video/3gpp2",
+};
+function sniffMime(file) {
+  const t = String((file && file.type) || "").trim();
+  if (t && t !== "application/octet-stream") return t;
+  const name = String((file && file.name) || "").toLowerCase();
+  const dot = name.lastIndexOf(".");
+  const ext = dot >= 0 ? name.slice(dot + 1) : "";
+  return EXT_MIME[ext] || t || "application/octet-stream";
+}
+
 export function quotaError(err) {
   const name = err && (err.name || err.code);
   return name === "QuotaExceededError" || name === 22 || /quota/i.test(String(err && err.message));
@@ -543,7 +559,8 @@ export class Vault {
       if (!this.dekKey) break;           // 已锁定：不再处理后续文件（每一个都会因无 key 抛错）
       const file = files[i];
       const name = (file && file.name) || "未命名";
-      const kind = /^image\//.test(file.type) ? "photo" : /^video\//.test(file.type) ? "video" : "file";
+      const mime = sniffMime(file);
+      const kind = /^image\//.test(mime) ? "photo" : /^video\//.test(mime) ? "video" : "file";
       const id = newId(kind === "photo" ? "p" : kind === "video" ? "v" : "x");
       attempted++;
       onProgress && onProgress({ index: i + 1, total, name, pct: (i / total) * 100 });
@@ -555,7 +572,7 @@ export class Vault {
           id,
           kind,
           name,
-          mime: file.type || "application/octet-stream",
+          mime,
           size: file.size || 0,
           w: 0, h: 0, dur: null,
           createdAt: now(),
@@ -569,7 +586,7 @@ export class Vault {
           const meta = await decodeImage(file);
           item.w = meta.w; item.h = meta.h; thumb = meta.thumb;
         } else if (kind === "video") {
-          const meta = await Cover.captureCover(file, { mime: file.type });
+          const meta = await Cover.captureCover(file, { mime });
           item.w = meta.w; item.h = meta.h; item.dur = meta.dur; thumb = meta.thumb;
         }
 

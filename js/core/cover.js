@@ -71,10 +71,14 @@ function waitEvent(el, names, ms) {
  * @returns {Promise<{w:number,h:number,dur:number|null,thumb:Uint8Array|null,reason?:string}>}
  *          永不抛错；失败了只是 thumb === null。
  */
-export async function captureCover(file, { mime, timeout = DEFAULT_TIMEOUT, at } = {}) {
+export async function captureCover(file, { mime, timeout, at } = {}) {
   const out = { w: 0, h: 0, dur: null, thumb: null };
   if (!file || typeof document === "undefined") return { ...out, reason: "nofile" };
   const type = mime || file.type || "";
+  // 大文件在 iOS 上取 metadata 更慢；给足时间，但仍有上限，失败只影响封面不影响导入
+  const size = Number(file.size) || 0;
+  const budget = timeout != null ? timeout
+    : (size > 500 * 1024 * 1024 ? 25000 : size > 80 * 1024 * 1024 ? 15000 : DEFAULT_TIMEOUT);
   let url = null;
   let video = null;
   try {
@@ -86,12 +90,12 @@ export async function captureCover(file, { mime, timeout = DEFAULT_TIMEOUT, at }
     video.playsInline = true;
     video.setAttribute("playsinline", "");
     video.setAttribute("webkit-playsinline", "");
-    video.crossOrigin = "anonymous";
+    /* 不要设 crossOrigin：blob: URL 上设了会让 canvas 被污染，toBlob/getImageData 失败 → 封面永远为空（iOS 尤甚） */
     video.style.cssText = "position:fixed;left:-2px;top:-2px;width:1px;height:1px;opacity:0;pointer-events:none;";
     video.src = url;
     video.load && video.load();
 
-    const metaOk = await waitEvent(video, ["loadedmetadata", "loadeddata"], Math.min(timeout, 5000));
+    const metaOk = await waitEvent(video, ["loadedmetadata", "loadeddata"], Math.min(budget, 12000));
     out.w = video.videoWidth || 0;
     out.h = video.videoHeight || 0;
     out.dur = Number.isFinite(video.duration) ? video.duration : null;
@@ -99,7 +103,7 @@ export async function captureCover(file, { mime, timeout = DEFAULT_TIMEOUT, at }
 
     const target = at == null ? frameTime(out.dur) : at;
     // 事件先挂、再改时间；已经在该位置（部分浏览器会因 src 片段自动 seek）就不等
-    const seeked = waitEvent(video, ["seeked", "loadeddata"], Math.min(timeout, 4000));
+    const seeked = waitEvent(video, ["seeked", "loadeddata"], Math.min(budget, 6000));
     try { video.currentTime = target; } catch { /* 某些编码不可 seek，用当前帧 */ }
     await seeked;
     if (video.readyState < 2) await waitEvent(video, ["loadeddata", "canplay"], 1500);

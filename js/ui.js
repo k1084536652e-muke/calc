@@ -58,6 +58,7 @@ import { DocEditor, toBrowseHTML } from "./ui/doc-editor.js";
 import { APP_VERSION } from "./version.js";
 import { warmLegacyDetection, legacyMigrationState, migrateLegacy } from "./legacy-migrate.js";
 import { checkForUpdate, applyUpdate, registerSW } from "./core/updater.js";
+import * as Stream from "./core/stream.js";
 
 /** 仓储与媒体缓存（由 initUI 注入） */
 let vault = null;
@@ -1918,8 +1919,29 @@ function hydrateSlots(v){
   });
   v.querySelectorAll("video[data-vid]").forEach(el=>{
     const id=el.dataset.vid;
+    const apply=(u)=>{
+      if(!(u&&el.isConnected)) return;
+      el.src=u+"#t=0.1";
+      vFirstFrame(el);
+      /* SW 被系统杀后旧 token 会 403：失败时重新授权并换新 URL，保留当前进度 */
+      if(el.dataset.streamRetryBound) return;
+      el.dataset.streamRetryBound="1";
+      el.addEventListener("error",()=>{
+        if(el.dataset.streamRetried) return;
+        el.dataset.streamRetried="1";
+        const t=el.currentTime||0;
+        media.release("video",id);
+        Stream.restore().catch(()=>{}).then(()=>media.ensure("video",id)).then(u2=>{
+          if(!(u2&&el.isConnected)) return;
+          el.src=u2;
+          const resume=()=>{ try{ if(t>0.2) el.currentTime=t; }catch(_){} };
+          if(el.readyState>=1) resume(); else el.addEventListener("loadedmetadata",resume,{once:true});
+          vFirstFrame(el);
+        });
+      },{once:true});
+    };
     media.ensure("video",id).then(u=>{
-      if(u&&el.isConnected){ el.src=u+"#t=0.1"; vFirstFrame(el); }
+      apply(u);
       /* 2.1.2：用户打开了这条视频（media 里已有解密 URL）→ 继续补剩下没封面的视频，
          大 legacy 文件正是靠这条路在不额外解密的前提下拿到封面 */
       if(u){ const it=findItem(id); if(it&&it.video&&!it.hasThumb) lazyBackfillCovers(); }

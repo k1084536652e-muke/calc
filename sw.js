@@ -7,7 +7,7 @@
  * - version.json 永远走网络（更新检查需要拿到线上版本），不进缓存。
  */
 
-const VERSION = "2.1.2";
+const VERSION = "2.1.3";
 const CACHE = "daishui-shell-" + VERSION;
 
 /** 本 App（2.1.x）外壳缓存前缀 */
@@ -87,10 +87,28 @@ async function isFirstUpgradeFromLegacy() {
  * importScripts 的脚本会随 SW 一起被浏览器缓存，断网冷启动同样可用。
  * 加载失败（文件缺失）→ 媒体请求 fail-closed 返回 503，绝不解密任何数据。
  */
-try { importScripts("/js/core/stream-sw.js"); } catch (err) { /* 见 fetch 分支的 503 兜底 */ }
+/**
+ * 部署根路径（与 SW 作用域一致）。
+ * 线上挂在 GitHub Pages 子目录 /calc/，本地测试挂在 /。
+ * 绝不能写死成站点根路径：否则 importScripts 404、虚拟媒体 URL 落在 SW 作用域外。
+ */
+const SCOPE_PATH = (() => {
+  try {
+    const u = new URL("./", self.location.href);
+    let path = u.pathname || "/";
+    if (!path.endsWith("/")) path += "/";
+    return path;
+  } catch {
+    return "/";
+  }
+})();
 
-/** 该路径是否是「加密媒体的虚拟 URL」——绝不进 app shell 缓存 */
-const MEDIA_PREFIX = "/__media/";
+try {
+  importScripts(new URL("js/core/stream-sw.js", self.location.href).href);
+} catch (err) { /* 见 fetch 分支的 503 兜底 */ }
+
+/** 加密媒体虚拟 URL 前缀（必须落在本 SW 作用域内，例：/calc/__media/） */
+const MEDIA_PREFIX = SCOPE_PATH + "__media/";
 
 function streamModule() {
   return self.__dsStream || null;

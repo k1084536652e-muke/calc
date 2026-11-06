@@ -23,7 +23,16 @@
   "use strict";
 
   var DB_NAME = "daishui-vault";
-  var MEDIA_PREFIX = "/__media/";
+  /* 与 sw.js 同一公式：子目录部署时必须是 /calc/__media/，不能是站点根 /__media/ */
+  var SCOPE_PATH = (function () {
+    try {
+      var u = new URL("./", self.location.href);
+      var path = u.pathname || "/";
+      if (path.charAt(path.length - 1) !== "/") path += "/";
+      return path;
+    } catch (e) { return "/"; }
+  })();
+  var MEDIA_PREFIX = SCOPE_PATH + "__media/";
   var MIME_RE = /^[a-z0-9.+-]+\/[a-z0-9.+-]+(\s*;\s*charset=[\w-]+)?$/i;
   var enc = new TextEncoder();
 

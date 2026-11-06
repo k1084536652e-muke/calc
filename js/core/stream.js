@@ -18,8 +18,17 @@
 
 import * as Chunks from "./chunks.js";
 
-const PREFIX = "/__media/";
 const ACK_TIMEOUT = 4000;
+
+/**
+ * 媒体虚拟 URL 必须落在当前页面所在目录（= SW scope）之下。
+ * 线上是 .../calc/__media/...；根路径部署/测试仍是 .../__media/...。
+ * 绝不能写成 location.origin + "/__media/"——那会跳出 /calc/ 作用域，SW 拦不到。
+ */
+function mediaHref(token, itemId) {
+  const base = new URL("./", location.href);
+  return new URL("__media/" + token + "/" + encodeURIComponent(itemId), base).href;
+}
 
 const state = {
   vault: null,
@@ -152,10 +161,10 @@ export async function urlFor(itemId, { mime } = {}) {
     ack = await ask({ type: "dsm/allow", token: fresh, id });
     if (!ack || !ack.ok) { state.ready = false; return null; }
     void mime;
-    return location.origin + PREFIX + fresh + "/" + encodeURIComponent(id);
+    return mediaHref(fresh, id);
   }
   void mime;   // Content-Type 由 chunkmeta 里的加密元数据决定，页面不额外传明文类型
-  return location.origin + PREFIX + token + "/" + encodeURIComponent(id);
+  return mediaHref(token, id);
 }
 
 /** 释放单个条目的播放授权（查看器关闭 / 删除条目时） */
