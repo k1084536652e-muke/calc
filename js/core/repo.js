@@ -20,7 +20,6 @@ export const DEFAULT_SETTINGS = {
   showNames: false,
   retention: "30",     // "7" | "30" | "90" | "never"
   slideInt: "3",       // "2" | "3" | "5" | "8"
-  slideMode: "seq",    // 2.2.3 幻灯片播放顺序 "seq" | "rand" | "loop"
   autoLock: "never",   // "never" | "60" | "120" | "300"（秒）；永不 = 不自动锁
 };
 

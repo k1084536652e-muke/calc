@@ -36,11 +36,6 @@ const I = {
  redo:'<path d="m15 14 5-5-5-5"/><path d="M20 9H9.5A5.5 5.5 0 0 0 4 14.5A5.5 5.5 0 0 0 9.5 20H13"/>',
  brush:'<path d="m16 22-1-4"/><path d="M19 13.99a1 1 0 0 0 1-1V12a2 2 0 0 0-2-2h-3a1 1 0 0 1-1-1V4a2 2 0 0 0-4 0v5a1 1 0 0 1-1 1H6a2 2 0 0 0-2 2v.99a1 1 0 0 0 1 1"/><path d="M5 14h14l1.973 6.767A1 1 0 0 1 20 22H4a1 1 0 0 1-.973-1.233z"/><path d="m8 22 1-4"/>',
  minus:'<path d="M5 12h14"/>',
- /* 2.2.3：幻灯片播放顺序——Lucide v1.65.0 arrow-right-to-line（单次正序）/ shuffle（单次随机）/ repeat（循环），
-    ISC License © Lucide Icons and Contributors（https://lucide.dev，许可证见 vendor/lucide/LICENSE） */
- ssseq:'<path d="M17 12H3"/><path d="m11 18 6-6-6-6"/><path d="M21 5v14"/>',
- ssrand:'<path d="m18 14 4 4-4 4"/><path d="m18 2 4 4-4 4"/><path d="M2 18h1.973a4 4 0 0 0 3.3-1.7l5.454-8.6a4 4 0 0 1 3.3-1.7H22"/><path d="M2 6h1.972a4 4 0 0 1 3.6 2.2"/><path d="M22 18h-6.041a4 4 0 0 1-3.3-1.8l-.359-.45"/>',
- ssloop:'<path d="m17 2 4 4-4 4"/><path d="M3 11v-1a4 4 0 0 1 4-4h14"/><path d="m7 22-4-4 4-4"/><path d="M21 13v1a4 4 0 0 1-4 4H3"/>',
  /* R10-05：Lucide v1.65.0 play / pause，ISC License © Lucide Icons and Contributors */
  play:'<path d="M5 5a2 2 0 0 1 3.008-1.728l11.997 6.998a2 2 0 0 1 .003 3.458l-12 7A2 2 0 0 1 5 19z"/>',
  pause:'<rect x="14" y="3" width="5" height="18" rx="1"/><rect x="5" y="3" width="5" height="18" rx="1"/>',
@@ -121,7 +116,6 @@ function hydrate(){
   S.showNames = !!vault.settings.showNames;
   S.retention = String(vault.settings.retention||"30");
   S.slideInt = String(vault.settings.slideInt||"3");
-  S.slideMode = SS_MODES.includes(vault.settings.slideMode)?vault.settings.slideMode:"seq";
   S.autoLock = String(vault.settings.autoLock||"never");
   S.wipeOn = !!(vault.auth && vault.auth.wipe);
 }
@@ -178,7 +172,6 @@ const S={picking:false,
   sub:null,
   doc:null,
   retention:"30",
-  slideMode:"seq", /* 2.2.3：幻灯片播放顺序 seq 单次正序 / rand 单次随机 / loop 循环（记在加密设置里） */
   slideInt:"3",   /* R10-09：幻灯片间隔（秒），设置页「幻灯片间隔」子页可选 2 / 3 / 5 / 8 */
   autoLock:"never", /* 2.2.0：自动锁定；never / 60 / 120 / 300（秒） */
   wipeOn:false,   /* 紧急清除码是否已配置（来自仓储，不在本地明文里留痕） */
@@ -2249,10 +2242,6 @@ function mountPlyr(host, video, stage, onAdjacent){
   stage.addEventListener("dblclick",e=>{ if(sideOf(e.clientX)) e.stopPropagation(); },true);
   return player;
 }
-/* 2.2.3：幻灯片播放顺序（顶栏「暂停 / 继续」左侧按钮依次切换）：单次正序（默认）→ 单次随机 → 循环播放 */
-const SS_MODES=["seq","rand","loop"];
-const SS_MODE_LABEL={seq:"单次正序",rand:"单次随机",loop:"循环播放"};
-function shuffleIds(a){ a=a.slice(); for(let i=a.length-1;i>0;i--){ const j=Math.floor(Math.random()*(i+1)); [a[i],a[j]]=[a[j],a[i]]; } return a; }
 function openViewer(id, opts){
   const it0=findItem(id);
   if(!it0||it0.doc){ toast(it0?("文档："+it0.name):"无法打开"); return; }
@@ -2271,7 +2260,7 @@ function openViewer(id, opts){
     <div class="vbar">${SS?`<button type="button" class="vbtn" data-x="back">${ic("x")}退出</button>`
     :`<button type="button" class="vbtn" data-x="back">${ic("chevl")}返回</button>`}
     <b></b>
-    ${SS?`<span class="vbtns"><button type="button" class="vbtn" data-x="ssmode"></button><button type="button" class="vbtn" data-x="pause" aria-label="暂停">${ic("pause")}</button></span>`
+    ${SS?`<button type="button" class="vbtn" data-x="pause" aria-label="暂停">${ic("pause")}</button>`
     :`<button type="button" class="vbtn" data-x="ren">${ic("pen")}重命名</button>`}</div>`;
   layer.appendChild(v);
   const rail=v.querySelector(".vrail"), track=v.querySelector(".vtrack"), bar=v.querySelector(".vbar");
@@ -2282,23 +2271,6 @@ function openViewer(id, opts){
   let player=null, mode=null, moved=false, dx=0, x0=0, y0=0, t0=0, panX=0, panY=0, pinch=null;
   let lastTap=0, lastX=0, lastY=0, tapSwallow=false;   /* 横拖起手于大播放按钮时，吞掉松手后那一次 click */
   let ssTimer=0, ssPaused=false;   /* R10-05：幻灯片照片停留计时 / 暂停状态（播到最后一项也进暂停） */
-  /* 2.2.3：播放顺序。items 在幻灯片模式下就是「实际播放序列」：idx 之前是已播过的，idx 之后按当前模式随时重排；
-     BASE = 相册原顺序。切换模式只重排 idx 之后的部分（从下一张起生效，不重新开始）。 */
-  const BASE=items.slice();
-  let ssMode=SS?(SS_MODES.includes(S.slideMode)?S.slideMode:"seq"):"seq";
-  const ssPlayed=new Set();   /* 本轮已播过的 id（单次随机据此只播剩下的） */
-  function ssPlan(){
-    const curId=items[idx], pos=Math.max(0,BASE.indexOf(curId));
-    let rest;
-    if(ssMode==="rand"){ rest=shuffleIds(BASE.filter(x=>!ssPlayed.has(x)&&x!==curId)); }
-    else if(ssMode==="loop"){ rest=BASE.slice(pos+1).concat(BASE); }   /* 末项之后接回第一项；每翻一页都会重新补足，永远播不完 */
-    else rest=BASE.slice(pos+1);
-    items.length=idx+1; items.push(...rest);
-  }
-  if(SS){
-    if(ssMode==="rand"){ const sh=shuffleIds(BASE); items.length=0; items.push(...sh); idx=0; }
-    ssPlayed.add(items[idx]); ssPlan();
-  }
   const P=new Map();   /* 活动指针 id → {x,y}：一指翻页 / 放大后平移，两指捏合 */
   /* R11-05：下滑退出（对齐 iOS 相册）。跟手作用在当前 .vslot 的 transform 上 —— 与 .vtrack（翻页）、.img（缩放）
      都不是同一个元素，三者互不抢；只动 transform / opacity，不改 left/top/width/height。外壳的黑色背景同步变淡，
@@ -2419,10 +2391,6 @@ function openViewer(id, opts){
   }
   function onChangePage(){
     resetZoom();
-    if(SS){   /* 2.2.3：循环模式回到第一项 = 新一轮；记下已播并按模式补齐后续顺序（renderSlots 预渲染的下一张随之更新） */
-      if(ssMode==="loop"&&items[idx]===BASE[0]) ssPlayed.clear();
-      ssPlayed.add(items[idx]); ssPlan();
-    }
     renderSlots();
     if(SS) ssArm();   /* R10-05：翻页（含手动滑）后按当前项重新计时 / 自动播放 */
     if(typeof pager.onChange==="function") pager.onChange(idx,cur());
@@ -2431,24 +2399,6 @@ function openViewer(id, opts){
      到最后一项不再前进：停在最后一项、进入暂停并显示控制条（不循环，用户可退出）。 */
   function ssBar(show){ v.classList.toggle("vbar-hidden",!show); }
   function ssIcon(){ const b=bar.querySelector('[data-x="pause"]'); if(!b) return; b.innerHTML=ic(ssPaused?"play":"pause"); b.setAttribute("aria-label",ssPaused?"继续":"暂停"); }
-  function ssModeIcon(){ const b=bar.querySelector('[data-x="ssmode"]'); if(!b) return; b.innerHTML=ic("ss"+ssMode); b.setAttribute("aria-label","播放顺序："+SS_MODE_LABEL[ssMode]); b.dataset.mode=ssMode; }
-  /* 2.2.3：只替换右侧（下一张）预渲染槽位，不动当前槽位——当前照片不闪、正在播的视频不重来 */
-  function ssRefreshNext(){
-    const nx=track.children[2], want=items[idx+1]||"";
-    if(!nx||(nx.dataset.slot||"")===want) return;
-    const tmp=document.createElement("div"); tmp.innerHTML=slotHTML(findItem(want));
-    const el=tmp.firstElementChild; nx.replaceWith(el);
-    el.querySelectorAll("video").forEach(vFirstFrame);
-    hydrateSlots(el);
-  }
-  function ssSetMode(m){
-    settleSlide();   /* 正在切换动画：先落定，再按新模式重排 */
-    ssMode=m; S.slideMode=m;
-    if(m==="rand"&&BASE.every(x=>ssPlayed.has(x))){ ssPlayed.clear(); ssPlayed.add(items[idx]); }   /* 都播过了：随机从头算一轮 */
-    ssPlan(); ssRefreshNext(); ssModeIcon();
-    toast(SS_MODE_LABEL[m]);
-    try{ vault.saveSettings({slideMode:m}).catch(()=>{}); }catch(_){}
-  }
   function ssClear(){ if(ssTimer){ clearTimeout(ssTimer); ssTimer=0; } }
   function ssVideo(){ const s=track.children[1]; return s?s.querySelector("video"):null; }
   function ssStop(){ ssClear(); const vd=ssVideo(); if(vd){ try{ vd.onended=null; vd.pause(); }catch(_){} } }
@@ -2623,7 +2573,6 @@ function openViewer(id, opts){
     const b=e.target.closest("[data-x]");
     if(!b) return;
     if(b.dataset.x==="back"){ close(); return; }
-    if(b.dataset.x==="ssmode"){ ssSetMode(SS_MODES[(SS_MODES.indexOf(ssMode)+1)%SS_MODES.length]); bumpAutoLock(); return; }
     if(b.dataset.x==="pause"){   /* R10-05：暂停 / 继续——照片停表、视频暂停；继续时当前项重新计时 / 续播 */
       ssPaused=!ssPaused; ssIcon();
       if(ssPaused) ssStop(); else ssArm();
@@ -2643,7 +2592,7 @@ function openViewer(id, opts){
     }
   });
   renderSlots();
-  if(SS){ ssBar(false); ssIcon(); ssModeIcon(); ssArm(); }   /* R10-05：幻灯片默认不显示控制条，从第一项开始播 */
+  if(SS){ ssBar(false); ssIcon(); ssArm(); }   /* R10-05：幻灯片默认不显示控制条，从第一项开始播 */
   window.__pager={   /* 验收调试（只读查询）：当前 index / items 的 id 列表 / 当前 scale / 轨道 transform */
     get index(){ return idx; },
     get ids(){ return items.slice(); },
@@ -2654,8 +2603,6 @@ function openViewer(id, opts){
     get slideshow(){ return SS; },
     get paused(){ return ssPaused; },
     get interval(){ return SI; },
-    get mode(){ return ssMode; },
-    get order(){ return items.slice(); },
     /* R11-05：下滑退出状态（只读）——active=正在跟手，dy=当前下移距离，scale=当前槽位缩放（1 即未动） */
     get dismiss(){ return {active:D.on,dy:Math.round(D.dy*10)/10,scale:Math.round((1-Math.min(D.dy/DH(),1)*0.35)*1000)/1000}; },
     get from(){ return {tab:from.tab,folder:from.folder}; },
