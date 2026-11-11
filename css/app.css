@@ -332,6 +332,7 @@ mark.hl{background:none;color:var(--danger);font-weight:650}
 .viewer .vbar b{font-size:15px;font-weight:600;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .viewer .vbtn{height:36px;padding:0 12px;border-radius:18px;background:rgba(40,40,42,.7);color:#fff;font-size:14px;display:flex;align-items:center;gap:2px;flex:0 0 auto}
 .viewer .vbtn svg.i{width:20px;height:20px}
+.viewer .vbtns{display:flex;align-items:center;gap:8px;flex:0 0 auto}   /* 2.2.3：幻灯片顶栏右侧「播放顺序 + 暂停/继续」 */
 /* R10-04/06/07：详情页横向翻页——外壳仍用 .viewer（#000，不随白天/黑夜主题）；内部一条轨道 + 三个槽位（上一张 / 当前 / 下一张），
    槽位宽 = 屏宽，槽位之间留 18px 间隙，间隙处露出外壳的黑色；轨道只做 translate3d，间隙不画任何元素。 */
 .viewer .vrail{position:absolute;inset:0;overflow:hidden;touch-action:none}   /* 整个翻页区域（含视频槽位 / 槽位间隙）不交给浏览器手势，否则触屏横滑会被接管并收到 pointercancel */
